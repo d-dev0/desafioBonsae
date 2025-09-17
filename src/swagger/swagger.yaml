@@ -1,0 +1,187 @@
+openapi: 3.0.0
+info:
+  title: API de Relatórios
+  version: 1.0.0
+  description: API para geração de relatórios em JSON, Excel e PDF.
+
+servers:
+  - url: http://localhost:3000
+
+paths:
+  /:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: API está rodando
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  message:
+                    type: string
+                    example: API de relatórios rodando
+
+  /relatorio:
+    post:
+      summary: Gera relatório em JSON
+      description: Retorna dados filtrados + estatísticas.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                turma_id:
+                  type: integer
+                  example: 1
+                professor_id:
+                  type: integer
+                  example: 2
+                atividade_id:
+                  type: integer
+                  example: 3
+                presenca:
+                  type: string
+                  enum: [Presente, Faltou, true, false]
+                  example: Presente
+                conceito:
+                  type: string
+                  example: "A"
+                status:
+                  type: string
+                  enum: [Aprovado, Reprovado, Pendente]
+                  example: Aprovado
+      responses:
+        "200":
+          description: Relatório em JSON
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  meta:
+                    type: object
+                    properties:
+                      total:
+                        type: integer
+                      mediaNotas:
+                        type: number
+                      frequencia:
+                        type: number
+                      aprovados:
+                        type: integer
+                      reprovados:
+                        type: integer
+                  rows:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        aluno:
+                          type: string
+                        email:
+                          type: string
+                        turma:
+                          type: string
+                        atividade:
+                          type: string
+                        nota:
+                          type: number
+                        conceito:
+                          type: string
+                        presenca:
+                          type: boolean
+                        horas:
+                          type: number
+                        status:
+                          type: string
+                        professores:
+                          type: string
+                  download_example:
+                    type: object
+                    properties:
+                      excel:
+                        type: string
+                      pdf:
+                        type: string
+
+  /download/excel:
+    get:
+      summary: Download do relatório em Excel
+      parameters:
+        - in: query
+          name: turma_id
+          schema:
+            type: integer
+        - in: query
+          name: professor_id
+          schema:
+            type: integer
+        - in: query
+          name: atividade_id
+          schema:
+            type: integer
+        - in: query
+          name: presenca
+          schema:
+            type: string
+        - in: query
+          name: conceito
+          schema:
+            type: string
+        - in: query
+          name: status
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Arquivo Excel
+          content:
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+
+  /download/pdf:
+    get:
+      summary: Download do relatório em PDF
+      parameters:
+        - in: query
+          name: turma_id
+          schema:
+            type: integer
+        - in: query
+          name: professor_id
+          schema:
+            type: integer
+        - in: query
+          name: atividade_id
+          schema:
+            type: integer
+        - in: query
+          name: presenca
+          schema:
+            type: string
+        - in: query
+          name: conceito
+          schema:
+            type: string
+        - in: query
+          name: status
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Arquivo PDF
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+                

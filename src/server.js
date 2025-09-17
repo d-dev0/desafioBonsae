@@ -4,6 +4,9 @@ import ExcelJS from "exceljs";
 import PDFDocument from "pdfkit";
 import { fileURLToPath } from "url";
 import path from "path";
+import fs from "fs";
+import swaggerUi from "swagger-ui-express";
+import YAML from "yamljs";
 
 const { Pool } = pkg;
 const app = express();
@@ -247,7 +250,25 @@ app.get("/download/pdf", async (req, res) => {
   }
 });
 
-// --- Start ---
+// --- Swagger (procura em /swagger/swagger.yaml ou ./swagger.yaml) ---
+const swaggerCandidates = [
+  path.join(__dirname, 'swagger', 'swagger.yaml'),
+  path.join(__dirname, 'swagger.yaml')
+];
+
+const swaggerPath = swaggerCandidates.find(p => fs.existsSync(p));
+if (swaggerPath) {
+  try {
+    const swaggerDocument = YAML.load(swaggerPath);
+    app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
+    console.log('Swagger UI disponível em /api-docs (arquivo:', swaggerPath + ')');
+  } catch (e) {
+    console.error('Erro ao carregar swagger.yaml:', e);
+  }
+} else {
+  console.warn('Nenhum swagger.yaml encontrado. Coloque o arquivo em "./swagger/swagger.yaml" ou "./swagger.yaml" para habilitar /api-docs.');
+}
+
 app.listen(port, () => {
   console.log(`Servidor rodando em http://localhost:${port}`);
 });
