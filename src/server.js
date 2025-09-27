@@ -4,6 +4,8 @@ import ExcelJS from "exceljs";
 import PDFDocument from "pdfkit";
 import { fileURLToPath } from "url";
 import path from "path";
+import swaggerUi from 'swagger-ui-express';
+import swaggerJsdoc from 'swagger-jsdoc';
 
 const { Pool } = pkg;
 const app = express();
@@ -26,6 +28,33 @@ app.use((req, res, next) => {
   next();
 });
 
+// --- Swagger/OpenAPI ---
+const swaggerDefinition = {
+  openapi: '3.0.0',
+  info: {
+    title: 'API de Relatórios',
+    version: '1.0.0',
+    description: 'API que gera relatórios, exporta Excel/PDF e fornece estatísticas.',
+  },
+  servers: [
+    {
+      url: `http://localhost:${port}`,
+      description: 'Servidor local',
+    },
+  ],
+};
+
+const options = {
+  definition: swaggerDefinition,
+  // inclui este mesmo arquivo para que o swagger-jsdoc leia os comentários @openapi
+  apis: [__filename],
+};
+
+const swaggerSpec = swaggerJsdoc(options);
+
+// Documentação (UI)
+app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+
 // --- Pool Postgres (use variáveis de ambiente no Docker) ---
 const pool = new Pool({
   user: process.env.PGUSER || "postgres",
@@ -36,6 +65,15 @@ const pool = new Pool({
 });
 
 // --- Health / root ---
+/**
+ * @openapi
+ * /:
+ *   get:
+ *     summary: Health check
+ *     responses:
+ *       200:
+ *         description: API running
+ */
 app.get("/", (req, res) => {
   res.json({ status: "ok", message: "API de relatórios rodando" });
 });
@@ -73,7 +111,6 @@ async function buscarRelatorio(filtros = {}) {
     where.push(`atv.id = $${params.length}`);
   }
   if (typeof presenca !== "undefined" && presenca !== "") {
-    // aceita "Presente" | "Faltou" | true/false
     const val = presenca === "Presente" || presenca === "true" || presenca === true;
     params.push(val);
     where.push(`p.presenca = $${params.length}`);
@@ -107,9 +144,35 @@ async function buscarRelatorio(filtros = {}) {
 }
 
 // --- Rota que retorna JSON com o relatório e estatísticas ---
+/**
+ * @openapi
+ * /relatorio:
+ *   post:
+ *     summary: Gera relatório com filtros e retorna estatísticas
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               turma_id:
+ *                 type: integer
+ *               professor_id:
+ *                 type: integer
+ *               atividade_id:
+ *                 type: integer
+ *               presenca:
+ *                 type: string
+ *               conceito:
+ *                 type: string
+ *               status:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Relatório gerado
+ */
 app.post("/relatorio", async (req, res) => {
   try {
-    // aceita filtros via JSON ou urlencoded
     const filtros = {
       turma_id: req.body.turma_id || req.body.turma || req.body.turmaId,
       professor_id: req.body.professor_id || req.body.professorId,
@@ -141,7 +204,6 @@ app.post("/relatorio", async (req, res) => {
         reprovados,
       },
       rows,
-      // exemplos de links para download (cliente pode usar estes URLs)
       download_example: {
         excel: `/download/excel?${new URLSearchParams(req.body).toString()}`,
         pdf: `/download/pdf?${new URLSearchParams(req.body).toString()}`,
@@ -154,6 +216,24 @@ app.post("/relatorio", async (req, res) => {
 });
 
 // --- Download Excel ---
+/**
+ * @openapi
+ * /download/excel:
+ *   get:
+ *     summary: Faz download do relatório em Excel
+ *     parameters:
+ *       - in: query
+ *         name: turma_id
+ *         schema:
+ *           type: integer
+ *       - in: query
+ *         name: professor_id
+ *         schema:
+ *           type: integer
+ *     responses:
+ *       200:
+ *         description: Arquivo Excel
+ */
 app.get("/download/excel", async (req, res) => {
   try {
     const rows = await buscarRelatorio(req.query);
@@ -192,6 +272,20 @@ app.get("/download/excel", async (req, res) => {
 });
 
 // --- Download PDF ---
+/**
+ * @openapi
+ * /download/pdf:
+ *   get:
+ *     summary: Faz download do relatório em PDF
+ *     parameters:
+ *       - in: query
+ *         name: turma_id
+ *         schema:
+ *           type: integer
+ *     responses:
+ *       200:
+ *         description: Arquivo PDF
+ */
 app.get("/download/pdf", async (req, res) => {
   try {
     const rows = await buscarRelatorio(req.query);
@@ -250,6 +344,7 @@ app.get("/download/pdf", async (req, res) => {
 // --- Start ---
 app.listen(port, () => {
   console.log(`Servidor rodando em http://localhost:${port}`);
+  console.log(`Swagger UI disponível em http://localhost:${port}/docs`);
 });
 
 // captura erros não tratados pra facilitar debug

@@ -29,7 +29,7 @@ docker compose up -d redis
 
 2) Iniciar a API e o Worker (em dois terminais separados)
 # terminal 1
-npm run start   # inicia a API (porta definida no .env, ex.: 3000)
+ npm run start  # inicia a API (porta definida no .env, ex.: 3000)
 
 # terminal 2
 npm run worker  # inicia o worker que processa os relatórios
