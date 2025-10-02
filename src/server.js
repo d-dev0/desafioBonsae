@@ -155,9 +155,9 @@ async function buscarRelatorio(filtros = {}) {
  *           schema:
  *             type: object
  *             properties:
- *               turma_id:
+ *               turma_id (1):
  *                 type: integer
- *               professor_id:
+ *               professor_id (1 or 2):
  *                 type: integer
  *               atividade_id:
  *                 type: integer
@@ -223,11 +223,11 @@ app.post("/relatorio", async (req, res) => {
  *     summary: Faz download do relatório em Excel
  *     parameters:
  *       - in: query
- *         name: turma_id
+ *         name: turma_id (1)
  *         schema:
  *           type: integer
  *       - in: query
- *         name: professor_id
+ *         name: professor_id (1 or 2)
  *         schema:
  *           type: integer
  *     responses:
@@ -279,7 +279,11 @@ app.get("/download/excel", async (req, res) => {
  *     summary: Faz download do relatório em PDF
  *     parameters:
  *       - in: query
- *         name: turma_id
+ *         name: turma_id (1)
+ *         schema:
+ *           type: integer
+ *       - in: query
+ *         name: professor_id (1 or 2)
  *         schema:
  *           type: integer
  *     responses:
