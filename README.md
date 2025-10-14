@@ -1,40 +1,52 @@
-# Desafio_Bonsae — README 
+# 📊 Desafio Bonsae — Geração de Relatórios com Node.js, Redis e PostgreSQL
+
+> Repositório oficial do desafio Bonsae — projeto que gera relatórios de grande volume usando **Node.js**, **Redis** e **PostgreSQL**, com suporte completo a **Docker Compose**.
 
 ---
 
-## Requisitos
+## 🚀 Tecnologias
 
-* Node.js 18+ (para rodar localmente, opcional quando usando Docker)
-* Docker Desktop (Windows/Mac) ou Docker Engine + Docker Compose v2
-* Git (opcional)
-
----
-
-## Como o README garante que o `docker compose up` suba sem problemas
-
-* Usa **volumes nomeados** para persistência do Postgres.
-* Adiciona **healthchecks** para Postgres e Redis para facilitar diagnósticos.
-* Recomenda usar um script `wait-for-it` para garantir que API/Worker esperem os serviços estarem prontos.
-* Inclui comandos claros para **limpeza segura** de dados corrompidos no Windows e Linux.
-* Traz passos de debug (`docker compose logs -f`) e recuperação mínima (`pg_resetwal` como último recurso).
+* **Node.js 18+** — API e worker para geração de relatórios (ExcelJS)
+* **Redis 7** — gerenciamento de filas (BullMQ)
+* **PostgreSQL 15** — armazenamento de dados
+* **Docker Compose** — orquestração completa dos serviços
 
 ---
 
-## Passo a passo rápido
+## ⚙️ Requisitos
 
-1. Clone o repo e instale dependências (se for rodar local):
+Antes de iniciar, garanta que você possui:
+
+* [Docker Desktop](https://www.docker.com/products/docker-desktop/) (ou Docker Engine + Docker Compose v2)
+* [Git](https://git-scm.com/downloads)
+* (Opcional) [Node.js 18+](https://nodejs.org/) caso queira rodar localmente sem Docker
+
+---
+
+## 🧩 Instalação e Configuração
+
+1️⃣ Clone o repositório e entre na pasta:
 
 ```bash
 git clone https://github.com/d-dev0/Desafio_Bonsae.git
 cd Desafio_Bonsae
+```
+
+2️⃣ Instale dependências (opcional se for rodar via Docker):
+
+```bash
 npm install
+```
+
+3️⃣ Crie o arquivo `.env` baseado no exemplo:
+
+```bash
 cp .env.example .env
-# edite .env conforme necessário
 ```
 
-2. (Recomendado) coloque no `.env` as conexões apontando para os nomes dos serviços do Compose quando for usar Docker:
+4️⃣ Ajuste o `.env` conforme necessário (valores padrão abaixo):
 
-```
+```env
 DB_HOST=postgres
 DB_PORT=5432
 REDIS_URL=redis://redis:6379
@@ -42,26 +54,31 @@ PORT=3000
 JOB_CONCURRENCY=2
 ```
 
-3. Suba tudo (build + rodar em background):
+---
+
+## 🐳 Rodando com Docker Compose
+
+Suba todos os serviços (API, Worker, Redis e Postgres):
 
 ```bash
 docker compose up --build -d
-+```
+```
 
-4. Monitoramento:
+### 🔍 Ver logs
 
 ```bash
-# ver todos os logs
 docker compose logs -f
-# ver logs de um serviço específico
-docker compose logs -f residencia_postgres
+```
+
+### 🧼 Parar e limpar tudo (inclusive volumes)
+
+```bash
+docker compose down -v
 ```
 
 ---
 
-## Arquivo recomendado `docker-compose.yml`
-
-Cole este arquivo no repositório (substitua o atual se quiser). Observação: **não** é necessário o campo `version:` com Docker Compose v2.
+## 🧱 Estrutura recomendada do `docker-compose.yml`
 
 ```yaml
 services:
@@ -108,7 +125,7 @@ services:
       - REDIS_URL=redis://redis:6379
     ports:
       - "3000:3000"
-    command: ["/bin/sh", "-c", "./wait-for-it.sh postgres:5432 -- ./start-api.sh"]
+    command: ["/bin/sh", "-c", "./wait-for-it.sh postgres:5432 -- npm run start"]
     volumes:
       - ./:/usr/src/app
 
@@ -132,123 +149,113 @@ volumes:
     driver: local
 ```
 
-**Notas sobre o compose acima**
-
-* `depends_on` garante ordem de criação, mas **não** garante que o serviço esteja pronto. Por isso usamos `wait-for-it.sh` na `command` da API/Worker para aguardar a porta do Postgres/Redis responder.
-* `postgres_data` é um **volume nomeado**: é mais robusto e evita problemas com permissões/selinux/NTFS quando comparado a montar pasta do host diretamente.
+> 💡 **Dica:** o uso de volume nomeado (`postgres_data`) evita problemas de permissões comuns no Windows e mantém os dados persistentes.
 
 ---
 
-## Arquivo `wait-for-it.sh` (opcional, recomendado)
+## 🕒 Script `wait-for-it.sh`
 
-Coloque o utilitário `wait-for-it.sh` na raiz do projeto (dê permissão de execução). Ele espera por uma porta TCP antes de executar o comando final.
+Esse script faz com que a API e o Worker aguardem o banco e o Redis ficarem prontos antes de iniciar.
 
-Exemplo mínimo (adicione ao repositório como `wait-for-it.sh`):
+Crie um arquivo `wait-for-it.sh` na raiz do projeto com o conteúdo abaixo e dê permissão de execução (`chmod +x wait-for-it.sh`):
 
 ```bash
 #!/usr/bin/env bash
-# https://github.com/vishnubob/wait-for-it
-# Versão reduzida — use a original caso precise de mais opções
-
 HOSTPORT=$1
 shift
 CMD=()
 for arg in "$@"; do
   CMD+=("$arg")
 done
-
 IFS=':' read HOST PORT <<< "${HOSTPORT}"
-
 until nc -z "$HOST" "$PORT"; do
-  echo "Waiting for $HOST:$PORT..."
+  echo "Aguardando $HOST:$PORT..."
   sleep 1
 done
-
-echo "$HOST:$PORT is up - executing command"
+echo "$HOST:$PORT está disponível — executando comando"
 exec "${CMD[@]}"
 ```
 
-No Dockerfile da API, garanta que `wait-for-it.sh` esteja copiado e `start-api.sh` exista (ou substitua `./start-api.sh` por `npm run start`).
-
 ---
 
-## Limpeza segura (quando o Postgres está corrompido)
+## 🧹 Corrigindo erro de banco corrompido
 
-> **Importante:** esses passos apagam dados. Faça backup antes se necessário.
+Se aparecer o erro:
 
-**Parar e remover containers + volumes anônimos**
+```
+PANIC: could not locate a valid checkpoint record
+```
+
+Execute:
 
 ```bash
 docker compose down -v
 ```
 
-**Windows (PowerShell) — remover pasta local postgres-data**
+E se estiver usando pastas locais:
+
+**Windows (PowerShell)**
 
 ```powershell
-# apenas se você usa pasta no host e quer remover
-Remove-Item -Recurse -Force ./postgres-data
+Remove-Item -Recurse -Force .\postgres-data
 ```
 
-**Linux / macOS**
+**Linux/Mac:**
 
 ```bash
 rm -rf ./postgres-data
 ```
 
-**Se você usa volume nomeado (recomendado)**
-
-```bash
-docker volume ls
-docker volume rm <nome_do_volume>  # ex: projeto_postgres_data
-```
-
 ---
 
-## Tratamento avançado (último recurso)
+## 🧪 Testando a API
 
-Se você precisa recuperar dados e **não pode apagar o volume**, procure restaurar de backup (`pg_dump` / `pg_basebackup`). Em último caso, `pg_resetwal` pode permitir reiniciar um cluster corrompido, mas **pode causar perda de transações**:
-
-```bash
-# ACESSAR O CONTAINER DO POSTGRES
-docker compose run --rm postgres bash
-# dentro do container
-pg_resetwal -f /var/lib/postgresql/data
-```
-
-Use isso apenas quando entender os riscos.
-
----
-
-## Debug rápido
-
-* Logs em tempo real:
-
-```bash
-docker compose logs -f
-```
-
-* Verificar health status dos serviços:
-
-```bash
-docker compose ps
-```
-
-* Acessar um shell no container do Postgres:
-
-```bash
-docker compose exec postgres bash
-# depois dentro do container
-psql -U postgres -d residencia
-```
-
----
-
-## Testes da API (mesmas rotas de antes)
-
-Criar job (ex.: 20k linhas):
+Crie um job de geração de relatório (exemplo: 20.000 linhas):
 
 ```bash
 curl -X POST http://localhost:3000/reports \
   -H "Content-Type: application/json" \
   -d '{"rows":20000, "columns":12, "title":"Relatório Bonsae"}'
 ```
+
+Exemplo de resposta:
+
+```json
+{
+  "jobId": "123",
+  "statusUrl": "http://localhost:3000/reports/123",
+  "downloadUrl": "http://localhost:3000/reports/123/download"
+}
+```
+
+Consultar status:
+
+```bash
+curl http://localhost:3000/reports/123
+```
+
+Baixar relatório pronto:
+
+```bash
+curl -OJ http://localhost:3000/reports/123/download
+```
+
+---
+
+## 🧭 Troubleshooting
+
+* Veja logs em tempo real:
+
+  ```bash
+  docker compose logs -f
+  ```
+* Cheque o status dos serviços:
+
+  ```bash
+  docker compose ps
+  ```
+* Acesse o banco:
+
+  ```bash
+  docker compose exec postgres psql -U postgres -d residencia
+  ```
