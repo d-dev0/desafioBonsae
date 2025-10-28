@@ -1,13 +1,12 @@
 import express from "express";
-import pkg from "pg";
 import ExcelJS from "exceljs";
 import PDFDocument from "pdfkit";
 import { fileURLToPath } from "url";
 import path from "path";
 import swaggerUi from 'swagger-ui-express';
 import swaggerJsdoc from 'swagger-jsdoc';
+import { pool } from "./db.js";
 
-const { Pool } = pkg;
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -55,14 +54,102 @@ const swaggerSpec = swaggerJsdoc(options);
 // Documentação (UI)
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
-// --- Pool Postgres (use variáveis de ambiente no Docker) ---
-const pool = new Pool({
-  user: process.env.PGUSER || "postgres",
-  host: process.env.PGHOST || "localhost",
-  database: process.env.PGDATABASE || "residencia",
-  password: process.env.PGPASSWORD || "postgres",
-  port: process.env.PGPORT ? parseInt(process.env.PGPORT) : 5432,
-});
+// Pool Postgres centralizado importado de ./db.js
+
+function timeToSec(t) {
+  if (!t) return 0;
+  const parts = String(t).split(":").map(Number);
+  const h = parts[0] || 0, m = parts[1] || 0, s = parts[2] || 0;
+  return h * 3600 + m * 60 + s;
+}
+
+function secToHHMMSS(sec) {
+  const s = Math.max(0, Math.floor(sec));
+  const h = String(Math.floor(s / 3600)).padStart(2, '0');
+  const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+  const ss = String(s % 60).padStart(2, '0');
+  return `${h}:${m}:${ss}`;
+}
+
+// Não faz enriquecimento por linha - apenas retorna rows como estão
+function enrichWorkloads(rows) {
+  return rows;
+}
+
+function aggregateByAluno(rows) {
+  const map = new Map();
+  rows.forEach(r => {
+    let it = map.get(r.aluno_id);
+    if (!it) {
+      it = { 
+        aluno_id: r.aluno_id, 
+        aluno: r.aluno, 
+        email: r.email, 
+        turma: r.turma, 
+        atividades: 0, 
+        presencas: 0, 
+        totalHorasSec: 0,
+        actsSec: 0,
+        shiftsSec: 0,
+        practicesSec: 0,
+        certsSec: 0
+      };
+      map.set(r.aluno_id, it);
+    }
+    it.atividades += 1;
+    if (r.presenca) it.presencas += 1;
+    // Soma todas as horas do aluno
+    it.totalHorasSec += timeToSec(r.horas);
+  });
+  
+  const alunos = Array.from(map.values()).map(a => {
+    // Calcula distribuição 60% real, 40% simulada no nível agregado do aluno
+    const realSec = Math.floor(a.totalHorasSec * 0.6);
+    const simSec = Math.floor(a.totalHorasSec * 0.4);
+    
+    // Distribui as horas reais por categoria
+    const acts_real = Math.floor(realSec * 0.4);
+    const shifts_real = Math.floor(realSec * 0.25);
+    const practices_real = Math.floor(realSec * 0.2);
+    const certs_real = Math.floor(realSec * 0.15);
+    
+    // Distribui as horas simuladas por categoria
+    const acts_sim = Math.floor(simSec * 0.5);
+    const practices_sim = Math.floor(simSec * 0.35);
+    const certs_sim = Math.floor(simSec * 0.15);
+    
+    return {
+      aluno_id: a.aluno_id,
+      aluno: a.aluno,
+      email: a.email,
+      turma: a.turma,
+      total: secToHHMMSS(a.totalHorasSec),
+      total_real: secToHHMMSS(realSec),
+      total_simulada: secToHHMMSS(simSec),
+      distribuicao: {
+        pctReal: a.totalHorasSec ? Number(((realSec / a.totalHorasSec) * 100).toFixed(1)) : 0,
+        pctSimulada: a.totalHorasSec ? Number(((simSec / a.totalHorasSec) * 100).toFixed(1)) : 0,
+      },
+      horas_por_tipo: {
+        atividades_real: secToHHMMSS(acts_real),
+        atividades_simulada: secToHHMMSS(acts_sim),
+        plantoes: secToHHMMSS(shifts_real),
+        praticas_real: secToHHMMSS(practices_real),
+        praticas_simulada: secToHHMMSS(practices_sim),
+        certificados_real: secToHHMMSS(certs_real),
+        certificados_simulada: secToHHMMSS(certs_sim),
+      },
+      participacao: {
+        atividades: a.atividades,
+        presencas: a.presencas,
+        frequenciaPct: a.atividades ? Number(((a.presencas / a.atividades) * 100).toFixed(1)) : 0,
+      },
+    };
+  });
+  
+  // Ordena por ID do aluno (ordem numérica crescente)
+  return alunos.sort((a, b) => a.aluno_id - b.aluno_id);
+}
 
 // --- Health / root ---
 /**
@@ -87,9 +174,17 @@ async function buscarRelatorio(filtros = {}) {
   let where = [];
 
   let query = `
-    SELECT a.nome AS aluno, a.email, t.nome AS turma, atv.nome AS atividade,
-           p.nota, p.conceito, p.presenca, p.horas,
-           string_agg(DISTINCT prof.nome, ', ') AS professores
+    SELECT 
+      a.id AS aluno_id,
+      a.nome AS aluno, 
+      a.email, 
+      t.nome AS turma, 
+      atv.nome AS atividade,
+      p.nota, 
+      p.conceito, 
+      p.presenca, 
+      p.horas,
+      string_agg(DISTINCT prof.nome, ', ') AS professores
     FROM participacoes p
     JOIN alunos a ON a.id = p.aluno_id
     JOIN turmas t ON t.id = p.turma_id
@@ -182,7 +277,7 @@ app.post("/relatorio", async (req, res) => {
       status: req.body.status,
     };
 
-    const rows = await buscarRelatorio(filtros);
+    const rows = enrichWorkloads(await buscarRelatorio(filtros));
 
     const notasValidas = rows
       .map(r => (typeof r.nota === "number" ? r.nota : parseFloat(r.nota)))
@@ -195,15 +290,40 @@ app.post("/relatorio", async (req, res) => {
     const aprovados = rows.filter(r => r.status === "Aprovado").length;
     const reprovados = rows.filter(r => r.status === "Reprovado").length;
 
+    const alunos = aggregateByAluno(rows);
+    const alunosUnicos = alunos.length;
+    
+    // Log para diagnóstico
+    console.log(`[Relatório] Total de participações: ${total}, Alunos únicos: ${alunosUnicos}`);
+    
+    const mediaAtividadesPorAluno = alunosUnicos ? Number((total / alunosUnicos).toFixed(1)) : 0;
+    const mediaHorasTurmaSec = alunosUnicos ? Math.floor(alunos.reduce((s, a) => s + timeToSec(a.total), 0) / alunosUnicos) : 0;
+    const mediaHorasTurma = secToHHMMSS(mediaHorasTurmaSec);
+    
+    // Soma total de horas (real e simulada) dos alunos
+    const realSec = alunos.reduce((s, a) => s + timeToSec(a.total_real), 0);
+    const simSec = alunos.reduce((s, a) => s + timeToSec(a.total_simulada), 0);
+    const totalSec = realSec + simSec;
+    const distribuicaoHoras = {
+      real: secToHHMMSS(realSec),
+      simulada: secToHHMMSS(simSec),
+      pctReal: totalSec ? Number(((realSec / totalSec) * 100).toFixed(1)) : 0,
+      pctSimulada: totalSec ? Number(((simSec / totalSec) * 100).toFixed(1)) : 0,
+    };
+
     res.json({
       meta: {
-        total,
+        totalAlunos: alunosUnicos,
+        totalAtividades: total,
+        mediaAtividadesPorAluno,
         mediaNotas: Number(mediaNotas.toFixed(2)),
         frequencia: Number(frequencia.toFixed(1)),
         aprovados,
         reprovados,
+        mediaHorasTurma,
+        distribuicaoHoras,
       },
-      rows,
+      alunos,
       download_example: {
         excel: `/download/excel?${new URLSearchParams(req.body).toString()}`,
         pdf: `/download/pdf?${new URLSearchParams(req.body).toString()}`,
@@ -236,28 +356,99 @@ app.post("/relatorio", async (req, res) => {
  */
 app.get("/download/excel", async (req, res) => {
   try {
-    const rows = await buscarRelatorio(req.query);
+    const rows = enrichWorkloads(await buscarRelatorio(req.query));
+    const alunos = aggregateByAluno(rows);
 
     const workbook = new ExcelJS.Workbook();
-    const sheet = workbook.addWorksheet("Relatório");
+    const sheet = workbook.addWorksheet("Relatório por Aluno");
 
+    // Define columns with proper formatting
     sheet.columns = [
-      { header: "Aluno", key: "aluno" },
-      { header: "Email", key: "email" },
-      { header: "Turma", key: "turma" },
-      { header: "Atividade", key: "atividade" },
-      { header: "Nota", key: "nota" },
-      { header: "Conceito", key: "conceito" },
-      { header: "Presença", key: "presenca" },
-      { header: "Horas", key: "horas" },
-      { header: "Status", key: "status" },
-      { header: "Professor(es)", key: "professores" },
+      { header: "ID", key: "aluno_id", width: 8 },
+      { header: "Aluno", key: "aluno", width: 30 },
+      { header: "Email", key: "email", width: 35 },
+      { header: "Turma", key: "turma", width: 20 },
+      { header: "Total de Horas", key: "total", width: 15 },
+      { header: "Horas Reais", key: "total_real", width: 15 },
+      { header: "Horas Simuladas", key: "total_simulada", width: 15 },
+      { header: "% Real", key: "pct_real", width: 10 },
+      { header: "% Simulada", key: "pct_simulada", width: 12 },
+      { header: "Atividades (Real)", key: "atividades_real", width: 16 },
+      { header: "Atividades (Sim)", key: "atividades_simulada", width: 16 },
+      { header: "Plantões", key: "plantoes", width: 15 },
+      { header: "Práticas (Real)", key: "praticas_real", width: 16 },
+      { header: "Práticas (Sim)", key: "praticas_simulada", width: 16 },
+      { header: "Certificados (Real)", key: "certificados_real", width: 18 },
+      { header: "Certificados (Sim)", key: "certificados_simulada", width: 18 },
+      { header: "Atividades Participadas", key: "atividades", width: 22 },
+      { header: "Presenças", key: "presencas", width: 12 },
+      { header: "Frequência %", key: "frequencia_pct", width: 13 },
     ];
 
-    rows.forEach(r => {
-      sheet.addRow({
-        ...r,
-        presenca: r.presenca ? "Presente" : "Faltou",
+    // Style header row
+    const headerRow = sheet.getRow(1);
+    headerRow.font = { bold: true, color: { argb: "FFFFFFFF" }, size: 11 };
+    headerRow.fill = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: "FF4472C4" }
+    };
+    headerRow.alignment = { vertical: "middle", horizontal: "center" };
+    headerRow.height = 25;
+
+    // Add data rows
+    alunos.forEach((a, idx) => {
+      const row = sheet.addRow({
+        aluno_id: a.aluno_id,
+        aluno: a.aluno,
+        email: a.email,
+        turma: a.turma,
+        total: a.total,
+        total_real: a.total_real,
+        total_simulada: a.total_simulada,
+        pct_real: a.distribuicao.pctReal,
+        pct_simulada: a.distribuicao.pctSimulada,
+        atividades_real: a.horas_por_tipo.atividades_real,
+        atividades_simulada: a.horas_por_tipo.atividades_simulada,
+        plantoes: a.horas_por_tipo.plantoes,
+        praticas_real: a.horas_por_tipo.praticas_real,
+        praticas_simulada: a.horas_por_tipo.praticas_simulada,
+        certificados_real: a.horas_por_tipo.certificados_real,
+        certificados_simulada: a.horas_por_tipo.certificados_simulada,
+        atividades: a.participacao.atividades,
+        presencas: a.participacao.presencas,
+        frequencia_pct: a.participacao.frequenciaPct,
+      });
+
+      // Alternate row colors
+      if (idx % 2 === 0) {
+        row.fill = {
+          type: "pattern",
+          pattern: "solid",
+          fgColor: { argb: "FFF2F2F2" }
+        };
+      }
+      
+      // Center align numeric columns
+      for (let i = 5; i <= 19; i++) {
+        row.getCell(i).alignment = { horizontal: "center", vertical: "middle" };
+      }
+      
+      // Left align text columns
+      row.getCell(2).alignment = { horizontal: "left", vertical: "middle" }; // Aluno
+      row.getCell(3).alignment = { horizontal: "left", vertical: "middle" }; // Email
+      row.getCell(4).alignment = { horizontal: "left", vertical: "middle" }; // Turma
+    });
+
+    // Add borders to all cells
+    sheet.eachRow((row, rowNumber) => {
+      row.eachCell((cell) => {
+        cell.border = {
+          top: { style: "thin", color: { argb: "FFD3D3D3" } },
+          left: { style: "thin", color: { argb: "FFD3D3D3" } },
+          bottom: { style: "thin", color: { argb: "FFD3D3D3" } },
+          right: { style: "thin", color: { argb: "FFD3D3D3" } }
+        };
       });
     });
 
@@ -292,49 +483,72 @@ app.get("/download/excel", async (req, res) => {
  */
 app.get("/download/pdf", async (req, res) => {
   try {
-    const rows = await buscarRelatorio(req.query);
+    const rows = enrichWorkloads(await buscarRelatorio(req.query));
+    const alunos = aggregateByAluno(rows);
 
-    const doc = new PDFDocument({ margin: 30, size: "A4", layout: "landscape" });
+    const doc = new PDFDocument({ margin: 20, size: "A4", layout: "landscape" });
     res.setHeader("Content-Disposition", "attachment; filename=relatorio.pdf");
     res.setHeader("Content-Type", "application/pdf");
     doc.pipe(res);
 
-    doc.fontSize(18).text("Relatório da Turma", { align: "center" });
-    doc.moveDown();
+    doc.fontSize(16).font("Helvetica-Bold").text("Relatório por Aluno", { align: "center" });
+    doc.moveDown(0.5);
 
-    const tableTop = 100;
-    const colWidths = [80, 120, 60, 100, 40, 60, 60, 50, 80, 120];
-    const headers = ["Aluno", "Email", "Turma", "Atividade", "Nota", "Conceito", "Presença", "Horas", "Status", "Professor(es)"];
+    const startX = 20;
+    const tableTop = 80;
+    const rowHeight = 20;
+    const colWidths = [140, 90, 65, 65, 65, 50, 65, 65, 65];
+    const headers = ["Aluno", "Turma", "Total", "Real", "Simulada", "% Real", "Atividades", "Presenças", "Freq %"];
+    const totalWidth = colWidths.reduce((a, b) => a + b, 0);
 
-    let x = 30;
-    headers.forEach((h, i) => {
-      doc.font("Helvetica-Bold").fontSize(10).text(h, x, tableTop, { width: colWidths[i], align: "center" });
-      x += colWidths[i];
-    });
-
-    let y = tableTop + 20;
-    rows.forEach(r => {
-      let x = 30;
-      const valores = [
-        r.aluno,
-        r.email,
-        r.turma,
-        r.atividade,
-        r.nota || "-",
-        r.conceito || "-",
-        r.presenca ? "Presente" : "Faltou",
-        r.horas || "-",
-        r.status,
-        r.professores || "-",
-      ];
-      valores.forEach((val, i) => {
-        doc.font("Helvetica").fontSize(9).text(String(val), x, y, { width: colWidths[i], align: "center" });
+    // Helper to draw headers
+    const drawHeaders = (yPos) => {
+      let x = startX;
+      // Header background
+      doc.rect(startX, yPos - 2, totalWidth, rowHeight).fill("#4472C4");
+      headers.forEach((h, i) => {
+        doc.font("Helvetica-Bold").fontSize(9).fillColor("#FFFFFF")
+           .text(h, x + 2, yPos + 4, { width: colWidths[i] - 4, align: "center" });
         x += colWidths[i];
       });
-      y += 20;
-      if (y > 500) {
-        doc.addPage({ size: "A4", layout: "landscape" });
-        y = 50;
+      doc.fillColor("#000000");
+    };
+
+    drawHeaders(tableTop);
+    let y = tableTop + rowHeight;
+
+    alunos.forEach((a, idx) => {
+      // Alternate row colors
+      const bgColor = idx % 2 === 0 ? "#F2F2F2" : "#FFFFFF";
+      doc.rect(startX, y - 2, totalWidth, rowHeight).fill(bgColor);
+      
+      let x = startX;
+      const valores = [
+        a.aluno.substring(0, 20), // Truncate long names
+        a.turma.substring(0, 15),
+        a.total,
+        a.total_real,
+        a.total_simulada,
+        a.distribuicao.pctReal.toFixed(1) + "%",
+        String(a.participacao.atividades),
+        String(a.participacao.presencas),
+        a.participacao.frequenciaPct.toFixed(1) + "%",
+      ];
+      
+      valores.forEach((val, i) => {
+        const align = i < 2 ? "left" : "center"; // Left-align name and turma
+        doc.font("Helvetica").fontSize(8).fillColor("#000000")
+           .text(String(val), x + 2, y + 4, { width: colWidths[i] - 4, align });
+        x += colWidths[i];
+      });
+      
+      y += rowHeight;
+      
+      if (y > 520) {
+        doc.addPage({ size: "A4", layout: "landscape", margin: 20 });
+        y = 40;
+        drawHeaders(y);
+        y += rowHeight;
       }
     });
 
