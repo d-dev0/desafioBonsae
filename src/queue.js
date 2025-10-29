@@ -11,12 +11,5 @@ const connection = new IORedis({
 
 export const reportQueue = new Queue(config.queueName, { connection });
 export const reportQueueEvents = new QueueEvents(config.queueName, { connection });
-
-export function createWorker(processor) {
-  return new Worker(config.queueName, processor, {
-    connection,
-    concurrency: config.concurrency,
-    lockDuration: 600000, // 10 min
-    autorun: true,
-  });
-}
+export const createWorker = (processor) => new Worker(config.queueName, processor, 
+  { connection, concurrency: config.concurrency, lockDuration: 600000, autorun: true });
