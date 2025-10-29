@@ -6,6 +6,9 @@ import path from "path";
 import swaggerUi from 'swagger-ui-express';
 import swaggerJsdoc from 'swagger-jsdoc';
 import { pool } from "./db.js";
+import { salvarRelatorio, listarRelatorios, buscarRelatorioSalvo, registrarDownload, removerRelatorio, ensureStorageDir, resolveStoragePath } from "./storage.js";
+import { writeFile, stat, readFile } from "fs/promises";
+import { createWriteStream } from "fs";
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -243,28 +246,61 @@ async function buscarRelatorio(filtros = {}) {
  * @openapi
  * /relatorio:
  *   post:
- *     summary: Gera relatório com filtros e retorna estatísticas
+ *     tags:
+ *       - Relatórios JSON
+ *     summary: Gera relatório com filtros e retorna estatísticas em JSON
+ *     description: Retorna dados agregados dos alunos com estatísticas completas (não gera arquivo)
  *     requestBody:
  *       content:
  *         application/json:
  *           schema:
  *             type: object
  *             properties:
- *               turma_id (1):
+ *               turma_id:
  *                 type: integer
- *               professor_id (1 or 2):
+ *                 example: 1
+ *               professor_id:
  *                 type: integer
+ *                 example: 1
  *               atividade_id:
  *                 type: integer
  *               presenca:
  *                 type: string
+ *                 example: "true"
  *               conceito:
  *                 type: string
  *               status:
  *                 type: string
+ *                 enum: [Aprovado, Reprovado, Pendente]
  *     responses:
  *       200:
- *         description: Relatório gerado
+ *         description: Relatório gerado com sucesso
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 meta:
+ *                   type: object
+ *                   properties:
+ *                     totalAlunos:
+ *                       type: integer
+ *                       example: 10
+ *                     totalAtividades:
+ *                       type: integer
+ *                       example: 50
+ *                     mediaNotas:
+ *                       type: number
+ *                       example: 7.5
+ *                     frequencia:
+ *                       type: number
+ *                       example: 85.2
+ *                 alunos:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *       500:
+ *         description: Erro ao gerar relatório
  */
 app.post("/relatorio", async (req, res) => {
   try {
@@ -340,24 +376,68 @@ app.post("/relatorio", async (req, res) => {
  * @openapi
  * /download/excel:
  *   get:
- *     summary: Faz download do relatório em Excel
+ *     tags:
+ *       - Gerar Relatórios
+ *     summary: Gera e faz download do relatório em Excel
+ *     description: Gera um novo relatório em formato Excel e salva automaticamente no banco de dados
  *     parameters:
  *       - in: query
- *         name: turma_id (1)
+ *         name: turma_id
  *         schema:
  *           type: integer
+ *         description: ID da turma para filtrar
+ *         example: 1
  *       - in: query
- *         name: professor_id (1 or 2)
+ *         name: professor_id
  *         schema:
  *           type: integer
+ *         description: ID do professor para filtrar
+ *         example: 1
+ *       - in: query
+ *         name: atividade_id
+ *         schema:
+ *           type: integer
+ *         description: ID da atividade para filtrar
+ *       - in: query
+ *         name: presenca
+ *         schema:
+ *           type: string
+ *         description: Filtrar por presença (Presente/true ou false)
+ *       - in: query
+ *         name: conceito
+ *         schema:
+ *           type: string
+ *         description: Filtrar por conceito
+ *       - in: query
+ *         name: status
+ *         schema:
+ *           type: string
+ *           enum: [Aprovado, Reprovado, Pendente]
+ *         description: Filtrar por status
  *     responses:
  *       200:
- *         description: Arquivo Excel
+ *         description: Arquivo Excel gerado e salvo
+ *         content:
+ *           application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+ *             schema:
+ *               type: string
+ *               format: binary
+ *       500:
+ *         description: Erro ao gerar Excel
  */
 app.get("/download/excel", async (req, res) => {
   try {
     const rows = enrichWorkloads(await buscarRelatorio(req.query));
     const alunos = aggregateByAluno(rows);
+
+    // Calcular estatísticas para salvar
+    const total = rows.length;
+    const alunosUnicos = alunos.length;
+    const notasValidas = rows
+      .map(r => (typeof r.nota === "number" ? r.nota : parseFloat(r.nota)))
+      .filter(n => !Number.isNaN(n));
+    const mediaNotas = notasValidas.length ? notasValidas.reduce((s, n) => s + n, 0) / notasValidas.length : 0;
+    const frequencia = total ? (rows.filter(r => r.presenca).length / total) * 100 : 0;
 
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet("Relatório por Aluno");
@@ -452,13 +532,380 @@ app.get("/download/excel", async (req, res) => {
       });
     });
 
+    // Salvar arquivo no disco
+    const timestamp = Date.now();
+    const fileName = `relatorio-${timestamp}.xlsx`;
+    const filePath = resolveStoragePath(fileName);
+    
+    await workbook.xlsx.writeFile(filePath);
+    
+    // Obter tamanho do arquivo
+    const fileStats = await stat(filePath);
+    
+    // Salvar no banco de dados
+    const relatorioId = await salvarRelatorio({
+      tipo: 'excel',
+      arquivo_nome: fileName,
+      arquivo_path: filePath,
+      tamanho_bytes: fileStats.size,
+      filtros: req.query,
+      estatisticas: {
+        totalAlunos: alunosUnicos,
+        totalAtividades: total,
+        mediaNotas: Number(mediaNotas.toFixed(2)),
+        frequencia: Number(frequencia.toFixed(1))
+      }
+    });
+
+    console.log(`Relatório Excel salvo com ID: ${relatorioId}`);
+
+    // Enviar arquivo para download
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", "attachment; filename=relatorio.xlsx");
-    await workbook.xlsx.write(res);
-    res.end();
+    res.setHeader("Content-Disposition", `attachment; filename=${fileName}`);
+    
+    const buffer = await readFile(filePath);
+    res.send(buffer);
   } catch (err) {
     console.error("Erro /download/excel:", err);
     if (!res.headersSent) res.status(500).send("Erro ao gerar Excel: " + err.message);
+  }
+});
+
+// --- Listar Relatórios Salvos ---
+/**
+ * @openapi
+ * /relatorios/salvos:
+ *   get:
+ *     tags:
+ *       - Relatórios Salvos
+ *     summary: Lista todos os relatórios salvos
+ *     description: Retorna lista completa de relatórios gerados com metadados, estatísticas e URL de download
+ *     parameters:
+ *       - in: query
+ *         name: tipo
+ *         schema:
+ *           type: string
+ *           enum: [excel, pdf]
+ *         description: Filtrar por tipo de relatório
+ *         example: excel
+ *       - in: query
+ *         name: limite
+ *         schema:
+ *           type: integer
+ *         description: Limitar número de resultados
+ *         example: 10
+ *     responses:
+ *       200:
+ *         description: Lista de relatórios com sucesso
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 total:
+ *                   type: integer
+ *                   example: 2
+ *                 relatorios:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       id:
+ *                         type: integer
+ *                         example: 1
+ *                       nome:
+ *                         type: string
+ *                         example: "Relatório Excel - 29/10/2025 17:30:45"
+ *                       tipo:
+ *                         type: string
+ *                         example: excel
+ *                       arquivo_nome:
+ *                         type: string
+ *                         example: relatorio-1730234445123.xlsx
+ *                       tamanho_mb:
+ *                         type: string
+ *                         example: "0.05"
+ *                       downloads:
+ *                         type: integer
+ *                         example: 3
+ *                       criado_em:
+ *                         type: string
+ *                         format: date-time
+ *                       url_download:
+ *                         type: string
+ *                         example: http://localhost:3000/relatorios/salvos/1/download
+ *       500:
+ *         description: Erro ao listar relatórios
+ */
+app.get("/relatorios/salvos", async (req, res) => {
+  try {
+    const opcoes = {
+      tipo: req.query.tipo,
+      limite: req.query.limite ? parseInt(req.query.limite) : undefined
+    };
+    
+    const relatorios = await listarRelatorios(opcoes);
+    
+    // Formatar resposta
+    const formatados = relatorios.map(r => ({
+      id: r.id,
+      tipo: r.tipo,
+      arquivo_nome: r.arquivo_nome,
+      tamanho_mb: r.tamanho_bytes ? (r.tamanho_bytes / 1024 / 1024).toFixed(2) : null,
+      filtros: r.filtros,
+      estatisticas: r.estatisticas,
+      criado_em: r.criado_em,
+      criado_por: r.criado_por,
+      downloads: r.downloads,
+      ultimo_download: r.ultimo_download,
+      status: r.status,
+      url_download: `${req.protocol}://${req.get('host')}/relatorios/salvos/${r.id}/download`
+    }));
+    
+    res.json({
+      total: formatados.length,
+      relatorios: formatados
+    });
+  } catch (err) {
+    console.error("Erro ao listar relatórios:", err);
+    res.status(500).json({ error: "Erro ao listar relatórios", message: err.message });
+  }
+});
+
+// --- Buscar Relatório Específico ---
+/**
+ * @openapi
+ * /relatorios/salvos/{id}:
+ *   get:
+ *     tags:
+ *       - Relatórios Salvos
+ *     summary: Busca detalhes de um relatório específico
+ *     description: Retorna informações completas sobre um relatório salvo incluindo filtros e estatísticas
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: ID do relatório
+ *         example: 1
+ *     responses:
+ *       200:
+ *         description: Detalhes do relatório
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 id:
+ *                   type: integer
+ *                   example: 1
+ *                 nome:
+ *                   type: string
+ *                   example: "Relatório Excel - 29/10/2025 17:30:45"
+ *                 tipo:
+ *                   type: string
+ *                   example: excel
+ *                 arquivo_nome:
+ *                   type: string
+ *                   example: relatorio-1730234445123.xlsx
+ *                 tamanho_mb:
+ *                   type: string
+ *                   example: "0.05"
+ *                 filtros:
+ *                   type: object
+ *                   example: {"turma_id": "1"}
+ *                 estatisticas:
+ *                   type: object
+ *                   example: {"totalAlunos": 10, "mediaNotas": 7.5}
+ *                 downloads:
+ *                   type: integer
+ *                   example: 3
+ *                 criado_em:
+ *                   type: string
+ *                   format: date-time
+ *                 url_download:
+ *                   type: string
+ *                   example: http://localhost:3000/relatorios/salvos/1/download
+ *       404:
+ *         description: Relatório não encontrado
+ *       500:
+ *         description: Erro ao buscar relatório
+ */
+app.get("/relatorios/salvos/:id", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const relatorio = await buscarRelatorioSalvo(id);
+    
+    if (!relatorio) {
+      return res.status(404).json({ error: "Relatório não encontrado" });
+    }
+    
+    res.json({
+      id: relatorio.id,
+      tipo: relatorio.tipo,
+      arquivo_nome: relatorio.arquivo_nome,
+      tamanho_mb: relatorio.tamanho_bytes ? (relatorio.tamanho_bytes / 1024 / 1024).toFixed(2) : null,
+      filtros: relatorio.filtros,
+      estatisticas: relatorio.estatisticas,
+      criado_em: relatorio.criado_em,
+      criado_por: relatorio.criado_por,
+      downloads: relatorio.downloads,
+      ultimo_download: relatorio.ultimo_download,
+      status: relatorio.status,
+      turma_id: relatorio.turma_id,
+      url_download: `${req.protocol}://${req.get('host')}/relatorios/salvos/${relatorio.id}/download`
+    });
+  } catch (err) {
+    console.error("Erro ao buscar relatório:", err);
+    res.status(500).json({ error: "Erro ao buscar relatório", message: err.message });
+  }
+});
+
+// --- Download de Relatório Salvo ---
+/**
+ * @openapi
+ * /relatorios/salvos/{id}/download:
+ *   get:
+ *     tags:
+ *       - Relatórios Salvos
+ *     summary: Faz download de um relatório salvo (sem regenerar)
+ *     description: Baixa o arquivo do relatório que já foi gerado anteriormente. Incrementa o contador de downloads.
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: ID do relatório
+ *         example: 1
+ *     responses:
+ *       200:
+ *         description: Arquivo do relatório (Excel ou PDF)
+ *         content:
+ *           application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+ *             schema:
+ *               type: string
+ *               format: binary
+ *           application/pdf:
+ *             schema:
+ *               type: string
+ *               format: binary
+ *       404:
+ *         description: Relatório não encontrado ou arquivo não existe no disco
+ *       500:
+ *         description: Erro ao baixar relatório
+ */
+app.get("/relatorios/salvos/:id/download", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const relatorio = await buscarRelatorioSalvo(id);
+    
+    if (!relatorio) {
+      return res.status(404).json({ error: "Relatório não encontrado" });
+    }
+    
+    // Verificar se arquivo existe
+    try {
+      await stat(relatorio.arquivo_path);
+    } catch (err) {
+      return res.status(404).json({ error: "Arquivo não encontrado no disco" });
+    }
+    
+    // Registrar download
+    await registrarDownload(id);
+    
+    // Determinar Content-Type
+    const contentType = relatorio.tipo === 'excel' 
+      ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      : 'application/pdf';
+    
+    // Enviar arquivo
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Content-Disposition", `attachment; filename=${relatorio.arquivo_nome}`);
+    
+    const buffer = await readFile(relatorio.arquivo_path);
+    res.send(buffer);
+  } catch (err) {
+    console.error("Erro ao baixar relatório:", err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Erro ao baixar relatório", message: err.message });
+    }
+  }
+});
+
+// --- Remover Relatório Salvo ---
+/**
+ * @openapi
+ * /relatorios/salvos/{id}:
+ *   delete:
+ *     tags:
+ *       - Relatórios Salvos
+ *     summary: Remove um relatório salvo
+ *     description: Remove o relatório do banco de dados e tenta remover o arquivo do disco
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: ID do relatório a ser removido
+ *         example: 1
+ *     responses:
+ *       200:
+ *         description: Relatório removido com sucesso
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 message:
+ *                   type: string
+ *                   example: "Relatório removido com sucesso"
+ *                 id:
+ *                   type: integer
+ *                   example: 1
+ *       404:
+ *         description: Relatório não encontrado
+ *       500:
+ *         description: Erro ao remover relatório
+ */
+app.delete("/relatorios/salvos/:id", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const relatorio = await buscarRelatorioSalvo(id);
+    
+    if (!relatorio) {
+      return res.status(404).json({ error: "Relatório não encontrado" });
+    }
+    
+    // Tentar remover arquivo do disco
+    try {
+      const { unlink } = await import('fs/promises');
+      await unlink(relatorio.arquivo_path);
+      console.log(`Arquivo ${relatorio.arquivo_nome} removido do disco`);
+    } catch (err) {
+      console.warn(`Não foi possível remover arquivo do disco: ${err.message}`);
+    }
+    
+    // Remover do banco
+    const removido = await removerRelatorio(id);
+    
+    if (removido) {
+      res.json({ 
+        success: true, 
+        message: "Relatório removido com sucesso",
+        id: id 
+      });
+    } else {
+      res.status(500).json({ error: "Erro ao remover relatório do banco" });
+    }
+  } catch (err) {
+    console.error("Erro ao remover relatório:", err);
+    res.status(500).json({ error: "Erro ao remover relatório", message: err.message });
   }
 });
 
@@ -467,29 +914,77 @@ app.get("/download/excel", async (req, res) => {
  * @openapi
  * /download/pdf:
  *   get:
- *     summary: Faz download do relatório em PDF
+ *     tags:
+ *       - Gerar Relatórios
+ *     summary: Gera e faz download do relatório em PDF
+ *     description: Gera um novo relatório em formato PDF e salva automaticamente no banco de dados
  *     parameters:
  *       - in: query
- *         name: turma_id (1)
+ *         name: turma_id
  *         schema:
  *           type: integer
+ *         description: ID da turma para filtrar
+ *         example: 1
  *       - in: query
- *         name: professor_id (1 or 2)
+ *         name: professor_id
  *         schema:
  *           type: integer
+ *         description: ID do professor para filtrar
+ *         example: 1
+ *       - in: query
+ *         name: atividade_id
+ *         schema:
+ *           type: integer
+ *         description: ID da atividade para filtrar
+ *       - in: query
+ *         name: presenca
+ *         schema:
+ *           type: string
+ *         description: Filtrar por presença (Presente/true ou false)
+ *       - in: query
+ *         name: conceito
+ *         schema:
+ *           type: string
+ *         description: Filtrar por conceito
+ *       - in: query
+ *         name: status
+ *         schema:
+ *           type: string
+ *           enum: [Aprovado, Reprovado, Pendente]
+ *         description: Filtrar por status
  *     responses:
  *       200:
- *         description: Arquivo PDF
+ *         description: Arquivo PDF gerado e salvo
+ *         content:
+ *           application/pdf:
+ *             schema:
+ *               type: string
+ *               format: binary
+ *       500:
+ *         description: Erro ao gerar PDF
  */
 app.get("/download/pdf", async (req, res) => {
   try {
     const rows = enrichWorkloads(await buscarRelatorio(req.query));
     const alunos = aggregateByAluno(rows);
 
+    // Calcular estatísticas para salvar
+    const total = rows.length;
+    const alunosUnicos = alunos.length;
+    const notasValidas = rows
+      .map(r => (typeof r.nota === "number" ? r.nota : parseFloat(r.nota)))
+      .filter(n => !Number.isNaN(n));
+    const mediaNotas = notasValidas.length ? notasValidas.reduce((s, n) => s + n, 0) / notasValidas.length : 0;
+    const frequencia = total ? (rows.filter(r => r.presenca).length / total) * 100 : 0;
+
+    // Criar arquivo temporário primeiro
+    const timestamp = Date.now();
+    const fileName = `relatorio-${timestamp}.pdf`;
+    const filePath = resolveStoragePath(fileName);
+
     const doc = new PDFDocument({ margin: 20, size: "A4", layout: "landscape" });
-    res.setHeader("Content-Disposition", "attachment; filename=relatorio.pdf");
-    res.setHeader("Content-Type", "application/pdf");
-    doc.pipe(res);
+    const stream = createWriteStream(filePath);
+    doc.pipe(stream);
 
     doc.fontSize(16).font("Helvetica-Bold").text("Relatório por Aluno", { align: "center" });
     doc.moveDown(0.5);
@@ -553,6 +1048,39 @@ app.get("/download/pdf", async (req, res) => {
     });
 
     doc.end();
+
+    // Aguardar conclusão da escrita
+    await new Promise((resolve, reject) => {
+      stream.on('finish', resolve);
+      stream.on('error', reject);
+    });
+
+    // Obter tamanho do arquivo
+    const fileStats = await stat(filePath);
+
+    // Salvar no banco de dados
+    const relatorioId = await salvarRelatorio({
+      tipo: 'pdf',
+      arquivo_nome: fileName,
+      arquivo_path: filePath,
+      tamanho_bytes: fileStats.size,
+      filtros: req.query,
+      estatisticas: {
+        totalAlunos: alunosUnicos,
+        totalAtividades: total,
+        mediaNotas: Number(mediaNotas.toFixed(2)),
+        frequencia: Number(frequencia.toFixed(1))
+      }
+    });
+
+    console.log(`Relatório PDF salvo com ID: ${relatorioId}`);
+
+    // Enviar arquivo para download
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename=${fileName}`);
+    
+    const buffer = await readFile(filePath);
+    res.send(buffer);
   } catch (err) {
     console.error("Erro /download/pdf:", err);
     if (!res.headersSent) res.status(500).send("Erro ao gerar PDF: " + err.message);
@@ -560,7 +1088,8 @@ app.get("/download/pdf", async (req, res) => {
 });
 
 // --- Start ---
-app.listen(port, () => {
+app.listen(port, async () => {
+  await ensureStorageDir();
   console.log(`Servidor rodando em http://localhost:${port}`);
   console.log(`Swagger UI disponível em http://localhost:${port}/docs`);
 });
