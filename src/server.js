@@ -130,7 +130,7 @@ app.get("/", (req, res) => {
 });
 
 const buscarRelatorio = async (filtros = {}) => {
-  const { turma_id, professor_id, atividade_id, presenca, conceito, status } = filtros;
+  const { turma_id, professor_id, atividade_id, aluno_id, presenca, conceito, status } = filtros;
   const params = [], where = [];
   
   let query = `SELECT a.id AS aluno_id, a.nome AS aluno, a.email, 
@@ -143,6 +143,7 @@ const buscarRelatorio = async (filtros = {}) => {
     LEFT JOIN professores prof ON prof.id = pt.professor_id`;
 
   if (turma_id) { params.push(turma_id); where.push(`t.id = $${params.length}`); }
+  if (aluno_id) { params.push(aluno_id); where.push(`a.id = $${params.length}`); }
   if (professor_id) { params.push(professor_id); where.push(`prof.id = $${params.length}`); }
   if (atividade_id) { params.push(atividade_id); where.push(`atv.id = $${params.length}`); }
   if (presenca !== undefined && presenca !== "") {
@@ -159,6 +160,66 @@ const buscarRelatorio = async (filtros = {}) => {
   return status ? result.rows.filter(r => r.status === status) : result.rows;
 };
 
+// Função específica para relatório de notas (sem horas)
+const buscarRelatorioNotas = async (filtros = {}) => {
+  const { turma_id, aluno_id, atividade_id, conceito, status } = filtros;
+  const params = [], where = [];
+  
+  let query = `SELECT a.id AS aluno_id, a.nome AS aluno, a.email, 
+    t.id AS turma_id, t.nome AS turma, 
+    atv.id AS atividade_id, atv.nome AS atividade, atv.tipo AS atividade_tipo,
+    p.nota, p.conceito, p.presenca, p.status_avaliacao,
+    string_agg(DISTINCT prof.nome, ', ') AS professores
+    FROM participacoes p JOIN alunos a ON a.id = p.aluno_id JOIN turmas t ON t.id = p.turma_id
+    JOIN atividades atv ON atv.id = p.atividade_id LEFT JOIN professor_turma pt ON pt.turma_id = t.id
+    LEFT JOIN professores prof ON prof.id = pt.professor_id`;
+
+  if (turma_id) { params.push(turma_id); where.push(`t.id = $${params.length}`); }
+  if (aluno_id) { params.push(aluno_id); where.push(`a.id = $${params.length}`); }
+  if (atividade_id) { params.push(atividade_id); where.push(`atv.id = $${params.length}`); }
+  if (conceito) { params.push(conceito); where.push(`p.conceito = $${params.length}`); }
+  
+  if (where.length) query += " WHERE " + where.join(" AND ");
+  query += ` GROUP BY a.id, t.id, atv.id, p.id ORDER BY a.id, atv.id`;
+  
+  const result = await pool.query(query, params);
+  result.rows.forEach(r => r.status = r.nota === null ? "Pendente" : Number(r.nota) >= 6 ? "Aprovado" : "Reprovado");
+  return status ? result.rows.filter(r => r.status === status) : result.rows;
+};
+
+// Agregação específica para notas (sem horas)
+const aggregateByAlunoNotas = (rows) => {
+  const map = new Map();
+  rows.forEach(r => {
+    const it = map.get(r.aluno_id) || { aluno_id: r.aluno_id, aluno: r.aluno, email: r.email, turma: r.turma, notas: [], atividades: 0, presencas: 0 };
+    it.atividades++;
+    if (r.presenca) it.presencas++;
+    if (r.nota !== null && r.nota !== undefined) {
+      it.notas.push(parseFloat(r.nota));
+    }
+    map.set(r.aluno_id, it);
+  });
+  
+  return Array.from(map.values()).map(a => {
+    const mediaNotas = a.notas.length > 0 ? a.notas.reduce((sum, n) => sum + n, 0) / a.notas.length : null;
+    const notaMin = a.notas.length > 0 ? Math.min(...a.notas) : null;
+    const notaMax = a.notas.length > 0 ? Math.max(...a.notas) : null;
+    
+    return {
+      aluno_id: a.aluno_id,
+      aluno: a.aluno,
+      email: a.email,
+      turma: a.turma,
+      mediaNotas: mediaNotas !== null ? +mediaNotas.toFixed(2) : null,
+      notaMin: notaMin !== null ? +notaMin.toFixed(2) : null,
+      notaMax: notaMax !== null ? +notaMax.toFixed(2) : null,
+      totalNotas: a.notas.length,
+      totalAtividades: a.atividades,
+      presencas: a.presencas,
+      frequenciaPct: a.atividades ? +((a.presencas / a.atividades) * 100).toFixed(1) : 0,
+    };
+  }).sort((a, b) => a.aluno_id - b.aluno_id);
+};
 
 // Função auxiliar para cálculo de estatísticas
 const calcEstatisticas = (rows, alunos) => {
@@ -170,252 +231,165 @@ const calcEstatisticas = (rows, alunos) => {
   };
 };
 
-// --- Download Excel Detalhado (Todas as Participações) ---
+// --- Download Relatório de Horas por Aluno (Excel) ---
 /**
  * @openapi
- * /download/excel-detalhado:
+ * /download/relatorio-horas-excel:
  *   get:
  *     tags:
- *       - Gerar Relatórios
- *     summary: Gera relatório detalhado com TODAS as participações individuais
- *     description: Gera um relatório Excel com TODAS as linhas de participações, incluindo TODOS os campos do banco (aluno, turma, atividade, tipo, nota, conceito, presença, horas, status_avaliacao, professores)
+ *       - Relatórios por Aluno
+ *     summary: Gera relatório de horas por aluno em Excel
+ *     description: |
+ *       Relatório focado em horas com total por aluno, distribuição real vs simulada, média por turma e indicadores de participação
  *     parameters:
- *       - in: query
- *         name: turma_id
- *         schema:
- *           type: integer
- *         description: ID da turma para filtrar
- *         example: 1
  *       - in: query
  *         name: professor_id
  *         schema:
  *           type: integer
  *         description: ID do professor para filtrar
  *       - in: query
- *         name: atividade_id
+ *         name: turma_id
  *         schema:
  *           type: integer
- *         description: ID da atividade para filtrar
- *       - in: query
- *         name: presenca
- *         schema:
- *           type: string
- *         description: Filtrar por presença
- *       - in: query
- *         name: conceito
- *         schema:
- *           type: string
- *         description: Filtrar por conceito
- *       - in: query
- *         name: status
- *         schema:
- *           type: string
- *         description: Filtrar por status
+ *         description: ID da turma para filtrar
  *     responses:
  *       200:
- *         description: Arquivo Excel detalhado gerado
- *         content:
- *           application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
- *             schema:
- *               type: string
- *               format: binary
+ *         description: Arquivo Excel gerado
+ *       404:
+ *         description: Nenhum dado encontrado
  *       500:
- *         description: Erro ao gerar Excel detalhado
+ *         description: Erro ao gerar relatório
  */
-app.get("/download/excel-detalhado", async (req, res) => {
+app.get("/download/relatorio-horas-excel", async (req, res) => {
   try {
     const rows = await buscarRelatorio(req.query);
-    
-    // Validação: não gerar relatório vazio
     if (!rows || rows.length === 0) {
-      return res.status(404).json({ 
-        error: "Nenhum dado encontrado", 
-        message: "Não há participações que correspondam aos filtros informados. Verifique os parâmetros e tente novamente.",
-        filtros: req.query 
-      });
+      return res.status(404).json({ error: "Nenhum dado encontrado", message: "Não há dados que correspondam aos filtros informados.", filtros: req.query });
     }
-    
     const alunos = aggregateByAluno(rows);
-    const { total, alunosUnicos, mediaNotas, frequencia } = calcEstatisticas(rows, alunos);
-
+    const turmaMap = new Map();
+    alunos.forEach(a => {
+      if (!turmaMap.has(a.turma)) turmaMap.set(a.turma, { totalSec: 0, count: 0 });
+      const turmaData = turmaMap.get(a.turma);
+      turmaData.totalSec += timeToSec(a.total);
+      turmaData.count++;
+    });
+    const mediaPorTurma = Array.from(turmaMap.entries()).map(([turma, data]) => ({ turma, mediaHoras: secToHHMMSS(Math.floor(data.totalSec / data.count)), totalAlunos: data.count }));
     const workbook = new ExcelJS.Workbook();
-    const sheet = workbook.addWorksheet("Relatório Detalhado - Todas Participações");
-    
+    const sheet = workbook.addWorksheet("Horas por Aluno");
     sheet.columns = [
-      { header: "ID Aluno", key: "aluno_id", width: 10 },
       { header: "Aluno", key: "aluno", width: 30 },
       { header: "Email", key: "email", width: 35 },
-      { header: "ID Turma", key: "turma_id", width: 10 },
       { header: "Turma", key: "turma", width: 20 },
-      { header: "ID Atividade", key: "atividade_id", width: 12 },
-      { header: "Atividade", key: "atividade", width: 30 },
-      { header: "Tipo Atividade", key: "atividade_tipo", width: 15 },
-      { header: "Nota", key: "nota", width: 10 },
-      { header: "Conceito", key: "conceito", width: 12 },
-      { header: "Presença", key: "presenca", width: 12 },
-      { header: "Horas", key: "horas", width: 12 },
-      { header: "Horas Reais", key: "horas_reais", width: 12 },
-      { header: "Horas Simuladas", key: "horas_simuladas", width: 15 },
-      { header: "% Real", key: "pct_real", width: 10 },
-      { header: "% Simulada", key: "pct_simulada", width: 12 },
-      { header: "Atividades (Real)", key: "atividades_real", width: 16 },
-      { header: "Atividades (Sim)", key: "atividades_sim", width: 16 },
-      { header: "Plantões", key: "plantoes", width: 12 },
-      { header: "Práticas (Real)", key: "praticas_real", width: 15 },
-      { header: "Práticas (Sim)", key: "praticas_sim", width: 15 },
-      { header: "Certificados (Real)", key: "certificados_real", width: 18 },
-      { header: "Certificados (Sim)", key: "certificados_sim", width: 18 },
-      { header: "Status Avaliação", key: "status_avaliacao", width: 16 },
-      { header: "Status", key: "status", width: 12 },
-      { header: "Professores", key: "professores", width: 30 },
+      { header: "Total de Horas", key: "total", width: 15 },
+      { header: "Horas Reais (60%)", key: "total_real", width: 18 },
+      { header: "Horas Simuladas (40%)", key: "total_simulada", width: 20 },
+      { header: "Total Atividades", key: "atividades", width: 15 },
+      { header: "Presenças", key: "presencas", width: 12 },
+      { header: "Frequência %", key: "frequencia", width: 12 },
     ];
-
     const headerRow = sheet.getRow(1);
     headerRow.font = { bold: true, color: { argb: "FFFFFFFF" }, size: 11 };
     headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4472C4" } };
     headerRow.alignment = { vertical: "middle", horizontal: "center" };
     headerRow.height = 25;
-
-    rows.forEach((r, idx) => {
-      const totalSec = timeToSec(r.horas);
-      const realSec = Math.floor(totalSec * 0.6);
-      const simSec = Math.floor(totalSec * 0.4);
-      const acts_r = Math.floor(realSec * 0.4);
-      const shifts_r = Math.floor(realSec * 0.25);
-      const pract_r = Math.floor(realSec * 0.2);
-      const certs_r = Math.floor(realSec * 0.15);
-      const acts_s = Math.floor(simSec * 0.5);
-      const pract_s = Math.floor(simSec * 0.35);
-      const certs_s = Math.floor(simSec * 0.15);
-      
+    alunos.forEach((a, idx) => {
       const row = sheet.addRow({
-        aluno_id: r.aluno_id,
-        aluno: r.aluno,
-        email: r.email,
-        turma_id: r.turma_id || 'N/A',
-        turma: r.turma,
-        atividade_id: r.atividade_id || 'N/A',
-        atividade: r.atividade,
-        atividade_tipo: r.atividade_tipo || 'N/A',
-        nota: r.nota !== null && r.nota !== undefined ? r.nota : 'N/A',
-        conceito: r.conceito || 'N/A',
-        presenca: r.presenca ? 'Presente' : 'Ausente',
-        horas: r.horas || '00:00:00',
-        horas_reais: secToHHMMSS(realSec),
-        horas_simuladas: secToHHMMSS(simSec),
-        pct_real: totalSec ? +((realSec / totalSec) * 100).toFixed(1) : 0,
-        pct_simulada: totalSec ? +((simSec / totalSec) * 100).toFixed(1) : 0,
-        atividades_real: secToHHMMSS(acts_r),
-        atividades_sim: secToHHMMSS(acts_s),
-        plantoes: secToHHMMSS(shifts_r),
-        praticas_real: secToHHMMSS(pract_r),
-        praticas_sim: secToHHMMSS(pract_s),
-        certificados_real: secToHHMMSS(certs_r),
-        certificados_sim: secToHHMMSS(certs_s),
-        status_avaliacao: r.status_avaliacao || 'N/A',
-        status: r.status,
-        professores: r.professores || 'N/A',
+        aluno: a.aluno,
+        email: a.email,
+        turma: a.turma,
+        total: a.total,
+        total_real: a.total_real,
+        total_simulada: a.total_simulada,
+        atividades: a.participacao.atividades,
+        presencas: a.participacao.presencas,
+        frequencia: a.participacao.frequenciaPct + '%'
       });
       if (idx % 2 === 0) row.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF2F2F2" } };
-      for (let i = 1; i <= 26; i++) {
-        row.getCell(i).alignment = { horizontal: i <= 3 ? "left" : "center", vertical: "middle" };
-      }
+      row.eachCell(cell => cell.alignment = { horizontal: "center", vertical: "middle" });
     });
-
+    sheet.addRow([]);
+    sheet.addRow([]);
+    const turmaHeaderRow = sheet.addRow(["Média de Horas por Turma"]);
+    turmaHeaderRow.font = { bold: true, size: 12, color: { argb: "FFFFFFFF" } };
+    turmaHeaderRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF2E75B6" } };
+    const turmaSubHeaderRow = sheet.addRow(["Turma", "Média de Horas", "Total de Alunos"]);
+    turmaSubHeaderRow.font = { bold: true };
+    turmaSubHeaderRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFD9E1F2" } };
+    mediaPorTurma.forEach(t => sheet.addRow([t.turma, t.mediaHoras, t.totalAlunos]));
     const borderStyle = { top: { style: "thin", color: { argb: "FFD3D3D3" } }, left: { style: "thin", color: { argb: "FFD3D3D3" } },
       bottom: { style: "thin", color: { argb: "FFD3D3D3" } }, right: { style: "thin", color: { argb: "FFD3D3D3" } } };
     sheet.eachRow(row => row.eachCell(cell => cell.border = borderStyle));
-
-    const fileName = `relatorio-detalhado-${Date.now()}.xlsx`;
+    const fileName = `relatorio-horas-${Date.now()}.xlsx`;
     const filePath = resolveStoragePath(fileName);
     await workbook.xlsx.writeFile(filePath);
     const fileStats = await stat(filePath);
-    
-    await salvarRelatorio({
-      tipo: 'excel', arquivo_nome: fileName, arquivo_path: filePath, tamanho_bytes: fileStats.size,
-      filtros: req.query, estatisticas: { totalParticipacoes: rows.length, totalAlunos: alunosUnicos, totalAtividades: total, mediaNotas: +mediaNotas.toFixed(2), frequencia: +frequencia.toFixed(1) }
-    });
-
+    await salvarRelatorio({ tipo: 'excel', arquivo_nome: fileName, arquivo_path: filePath, tamanho_bytes: fileStats.size,
+      filtros: req.query, estatisticas: { totalAlunos: alunos.length, turmas: mediaPorTurma.length } });
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", `attachment; filename=${fileName}`);
     res.send(await readFile(filePath));
   } catch (err) {
-    console.error("Erro /download/excel-detalhado:", err);
-    if (!res.headersSent) res.status(500).send("Erro ao gerar Excel detalhado: " + err.message);
+    console.error("Erro /download/relatorio-horas-excel:", err);
+    if (!res.headersSent) res.status(500).send("Erro ao gerar relatório de horas: " + err.message);
   }
 });
 
-// --- Download PDF Detalhado (Todas as Participações) ---
+// --- Download Relatório de Horas por Aluno (PDF) ---
 /**
  * @openapi
- * /download/pdf-detalhado:
+ * /download/relatorio-horas-pdf:
  *   get:
  *     tags:
- *       - Gerar Relatórios
- *     summary: Gera relatório detalhado em PDF com TODAS as participações individuais
- *     description: Gera um relatório PDF com TODAS as linhas de participações, incluindo TODOS os campos do banco
+ *       - Relatórios por Aluno
+ *     summary: Gera relatório de horas por aluno em PDF
+ *     description: |
+ *       Relatório focado em horas com total por aluno, distribuição real vs simulada, média por turma e indicadores de participação
  *     parameters:
- *       - in: query
- *         name: turma_id
- *         schema:
- *           type: integer
- *         description: ID da turma para filtrar
  *       - in: query
  *         name: professor_id
  *         schema:
  *           type: integer
  *         description: ID do professor para filtrar
  *       - in: query
- *         name: atividade_id
+ *         name: turma_id
  *         schema:
  *           type: integer
- *         description: ID da atividade para filtrar
- *       - in: query
- *         name: presenca
- *         schema:
- *           type: string
- *         description: Filtrar por presença
- *       - in: query
- *         name: conceito
- *         schema:
- *           type: string
- *         description: Filtrar por conceito
- *       - in: query
- *         name: status
- *         schema:
- *           type: string
- *         description: Filtrar por status
+ *         description: ID da turma para filtrar
  *     responses:
  *       200:
- *         description: Arquivo PDF detalhado gerado
- *         content:
- *           application/pdf:
- *             schema:
- *               type: string
- *               format: binary
+ *         description: Arquivo PDF gerado
+ *       404:
+ *         description: Nenhum dado encontrado
  *       500:
- *         description: Erro ao gerar PDF detalhado
+ *         description: Erro ao gerar relatório
  */
-app.get("/download/pdf-detalhado", async (req, res) => {
+app.get("/download/relatorio-horas-pdf", async (req, res) => {
   try {
     const rows = await buscarRelatorio(req.query);
+    if (!rows || rows.length === 0) {
+      return res.status(404).json({ error: "Nenhum dado encontrado", message: "Não há dados que correspondam aos filtros informados.", filtros: req.query });
+    }
     const alunos = aggregateByAluno(rows);
-    const { total, alunosUnicos, mediaNotas, frequencia } = calcEstatisticas(rows, alunos);
-
-    const fileName = `relatorio-detalhado-${Date.now()}.pdf`;
+    const turmaMap = new Map();
+    alunos.forEach(a => {
+      if (!turmaMap.has(a.turma)) turmaMap.set(a.turma, { totalSec: 0, count: 0 });
+      const turmaData = turmaMap.get(a.turma);
+      turmaData.totalSec += timeToSec(a.total);
+      turmaData.count++;
+    });
+    const mediaPorTurma = Array.from(turmaMap.entries()).map(([turma, data]) => ({ turma, mediaHoras: secToHHMMSS(Math.floor(data.totalSec / data.count)), totalAlunos: data.count }));
+    const fileName = `relatorio-horas-${Date.now()}.pdf`;
     const filePath = resolveStoragePath(fileName);
     const doc = new PDFDocument({ margin: 10, size: "A4", layout: "landscape" });
     const stream = createWriteStream(filePath);
     doc.pipe(stream);
-
-    doc.fontSize(14).font("Helvetica-Bold").text("Relatório Detalhado - Todas as Participações", { align: "center" }).moveDown(0.5);
-    doc.fontSize(9).font("Helvetica").text(`Total de Participações: ${rows.length} | Alunos: ${alunosUnicos} | Média Notas: ${mediaNotas.toFixed(2)} | Frequência: ${frequencia.toFixed(1)}%`, { align: "center" }).moveDown(0.5);
-
+    doc.fontSize(14).font("Helvetica-Bold").text("Relatório de Horas por Aluno", { align: "center" }).moveDown(0.5);
+    doc.fontSize(9).font("Helvetica").text(`Total de Alunos: ${alunos.length} | Turmas: ${mediaPorTurma.length}`, { align: "center" }).moveDown(0.5);
     const [startX, tableTop, rowHeight] = [10, 80, 18];
-    const colWidths = [50, 80, 60, 40, 35, 35, 35, 35, 35, 35, 35, 35, 35, 50];
-    const headers = ["Aluno", "Turma", "Atividade", "Tipo", "Nota", "Conceito", "Pres.", "Horas", "H.Real", "H.Sim", "% R", "% S", "Status", "Professores"];
+    const colWidths = [50, 80, 60, 50, 50, 40, 40, 50, 40, 40];
+    const headers = ["Aluno", "Turma", "Total Horas", "H.Real", "H.Sim", "% R", "% S", "Atividades", "Presenças", "Freq%"];
     const totalWidth = colWidths.reduce((a, b) => a + b, 0);
-
     const drawHeaders = (yPos) => {
       doc.rect(startX, yPos - 2, totalWidth, rowHeight).fill("#4472C4");
       let x = startX;
@@ -425,11 +399,218 @@ app.get("/download/pdf-detalhado", async (req, res) => {
       });
       doc.fillColor("#000000");
     };
-
     let yPos = tableTop;
     drawHeaders(yPos);
     yPos += rowHeight;
+    alunos.forEach((a, idx) => {
+      if (yPos > 520) {
+        doc.addPage({ margin: 10, size: "A4", layout: "landscape" });
+        yPos = 40;
+        drawHeaders(yPos);
+        yPos += rowHeight;
+      }
+      if (idx % 2 === 0) doc.rect(startX, yPos - 2, totalWidth, rowHeight).fill("#F2F2F2");
+      const rowData = [a.aluno.substring(0, 15), a.turma.substring(0, 20), a.total, a.total_real, a.total_simulada,
+        a.distribuicao.pctReal + '%', a.distribuicao.pctSimulada + '%', a.participacao.atividades, a.participacao.presencas, a.participacao.frequenciaPct + '%'];
+      let x = startX;
+      rowData.forEach((val, i) => {
+        doc.font("Helvetica").fontSize(6).fillColor("#000000").text(String(val), x + 2, yPos + 4, { width: colWidths[i] - 4, align: i < 2 ? "left" : "center" });
+        x += colWidths[i];
+      });
+      yPos += rowHeight;
+    });
+    if (yPos > 450) { doc.addPage({ margin: 10, size: "A4", layout: "landscape" }); yPos = 40; }
+    yPos += 20;
+    doc.fontSize(12).font("Helvetica-Bold").fillColor("#000000").text("Média de Horas por Turma", startX, yPos);
+    yPos += 20;
+    mediaPorTurma.forEach(t => {
+      doc.fontSize(9).font("Helvetica").text(`${t.turma}: ${t.mediaHoras} (${t.totalAlunos} alunos)`, startX, yPos);
+      yPos += 15;
+    });
+    doc.end();
+    await new Promise((resolve, reject) => { stream.on("finish", resolve); stream.on("error", reject); });
+    const fileStats = await stat(filePath);
+    await salvarRelatorio({ tipo: 'pdf', arquivo_nome: fileName, arquivo_path: filePath, tamanho_bytes: fileStats.size,
+      filtros: req.query, estatisticas: { totalAlunos: alunos.length, turmas: mediaPorTurma.length } });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename=${fileName}`);
+    res.send(await readFile(filePath));
+  } catch (err) {
+    console.error("Erro /download/relatorio-horas-pdf:", err);
+    if (!res.headersSent) res.status(500).send("Erro ao gerar relatório de horas: " + err.message);
+  }
+});
 
+// --- Download Relatório de Notas por Atividade (Excel) ---
+/**
+ * @openapi
+ * /download/relatorio-notas-excel:
+ *   get:
+ *     tags:
+ *       - Relatórios por Aluno
+ *     summary: Gera relatório de notas por atividade realizada por aluno em Excel
+ *     description: |
+ *       Relatório mostrando cada nota obtida pelo aluno em cada atividade realizada
+ *     parameters:
+ *       - in: query
+ *         name: professor_id
+ *         schema:
+ *           type: integer
+ *         description: ID do professor para filtrar
+ *       - in: query
+ *         name: turma_id
+ *         schema:
+ *           type: integer
+ *         description: ID da turma para filtrar
+ *     responses:
+ *       200:
+ *         description: Arquivo Excel gerado
+ *       404:
+ *         description: Nenhum dado encontrado
+ *       500:
+ *         description: Erro ao gerar relatório
+ */
+app.get("/download/relatorio-notas-excel", async (req, res) => {
+  try {
+    const rows = await buscarRelatorioNotas(req.query);
+    if (!rows || rows.length === 0) {
+      return res.status(404).json({ error: "Nenhum dado encontrado", message: "Não há dados que correspondam aos filtros informados.", filtros: req.query });
+    }
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("Notas por Atividade");
+    sheet.columns = [
+      { header: "Aluno", key: "aluno", width: 30 },
+      { header: "Email", key: "email", width: 35 },
+      { header: "Turma", key: "turma", width: 20 },
+      { header: "Atividade", key: "atividade", width: 30 },
+      { header: "Tipo", key: "tipo", width: 15 },
+      { header: "Nota", key: "nota", width: 10 },
+      { header: "Conceito", key: "conceito", width: 12 },
+      { header: "Status", key: "status", width: 12 },
+      { header: "Status Avaliação", key: "status_avaliacao", width: 16 },
+      { header: "Presença", key: "presenca", width: 12 },
+      { header: "Professores", key: "professores", width: 30 },
+    ];
+    const headerRow = sheet.getRow(1);
+    headerRow.font = { bold: true, color: { argb: "FFFFFFFF" }, size: 11 };
+    headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4472C4" } };
+    headerRow.alignment = { vertical: "middle", horizontal: "center" };
+    headerRow.height = 25;
+    rows.forEach((r, idx) => {
+      const row = sheet.addRow({
+        aluno: r.aluno,
+        email: r.email,
+        turma: r.turma,
+        atividade: r.atividade,
+        tipo: r.atividade_tipo || 'N/A',
+        nota: r.nota !== null && r.nota !== undefined ? r.nota : 'Pendente',
+        conceito: r.conceito || 'N/A',
+        status: r.status,
+        status_avaliacao: r.status_avaliacao || 'N/A',
+        presenca: r.presenca ? 'Presente' : 'Ausente',
+        professores: r.professores || 'N/A',
+      });
+      if (idx % 2 === 0) row.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF2F2F2" } };
+      row.eachCell(cell => cell.alignment = { horizontal: "center", vertical: "middle" });
+      if (r.status === "Aprovado") {
+        row.getCell('status').fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFC6EFCE" } };
+      } else if (r.status === "Reprovado") {
+        row.getCell('status').fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFC7CE" } };
+      }
+    });
+    sheet.addRow([]);
+    sheet.addRow([]);
+    const alunos = aggregateByAlunoNotas(rows);
+    const statsHeaderRow = sheet.addRow(["Resumo por Aluno"]);
+    statsHeaderRow.font = { bold: true, size: 12, color: { argb: "FFFFFFFF" } };
+    statsHeaderRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF2E75B6" } };
+    const statsSubHeaderRow = sheet.addRow(["Aluno", "Turma", "Média", "Nota Mín", "Nota Máx", "Total Notas", "Aprovações", "Reprovações", "Freq%"]);
+    statsSubHeaderRow.font = { bold: true };
+    statsSubHeaderRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFD9E1F2" } };
+    alunos.forEach(a => {
+      const alunoRows = rows.filter(r => r.aluno_id === a.aluno_id);
+      const aprovacoes = alunoRows.filter(r => r.status === "Aprovado").length;
+      const reprovacoes = alunoRows.filter(r => r.status === "Reprovado").length;
+      sheet.addRow([a.aluno, a.turma, a.mediaNotas !== null ? a.mediaNotas : 'N/A', a.notaMin !== null ? a.notaMin : 'N/A',
+        a.notaMax !== null ? a.notaMax : 'N/A', a.totalNotas, aprovacoes, reprovacoes, a.frequenciaPct + '%']);
+    });
+    const borderStyle = { top: { style: "thin", color: { argb: "FFD3D3D3" } }, left: { style: "thin", color: { argb: "FFD3D3D3" } },
+      bottom: { style: "thin", color: { argb: "FFD3D3D3" } }, right: { style: "thin", color: { argb: "FFD3D3D3" } } };
+    sheet.eachRow(row => row.eachCell(cell => cell.border = borderStyle));
+    const fileName = `relatorio-notas-${Date.now()}.xlsx`;
+    const filePath = resolveStoragePath(fileName);
+    await workbook.xlsx.writeFile(filePath);
+    const fileStats = await stat(filePath);
+    await salvarRelatorio({ tipo: 'excel', arquivo_nome: fileName, arquivo_path: filePath, tamanho_bytes: fileStats.size,
+      filtros: req.query, estatisticas: { totalParticipacoes: rows.length, totalAlunos: alunos.length } });
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename=${fileName}`);
+    res.send(await readFile(filePath));
+  } catch (err) {
+    console.error("Erro /download/relatorio-notas-excel:", err);
+    if (!res.headersSent) res.status(500).send("Erro ao gerar relatório de notas: " + err.message);
+  }
+});
+
+// --- Download Relatório de Notas por Atividade (PDF) ---
+/**
+ * @openapi
+ * /download/relatorio-notas-pdf:
+ *   get:
+ *     tags:
+ *       - Relatórios por Aluno
+ *     summary: Gera relatório de notas por atividade realizada por aluno em PDF
+ *     description: |
+ *       Relatório mostrando cada nota obtida pelo aluno em cada atividade realizada
+ *     parameters:
+ *       - in: query
+ *         name: professor_id
+ *         schema:
+ *           type: integer
+ *         description: ID do professor para filtrar
+ *       - in: query
+ *         name: turma_id
+ *         schema:
+ *           type: integer
+ *         description: ID da turma para filtrar
+ *     responses:
+ *       200:
+ *         description: Arquivo PDF gerado
+ *       404:
+ *         description: Nenhum dado encontrado
+ *       500:
+ *         description: Erro ao gerar relatório
+ */
+app.get("/download/relatorio-notas-pdf", async (req, res) => {
+  try {
+    const rows = await buscarRelatorioNotas(req.query);
+    if (!rows || rows.length === 0) {
+      return res.status(404).json({ error: "Nenhum dado encontrado", message: "Não há dados que correspondam aos filtros informados.", filtros: req.query });
+    }
+    const alunos = aggregateByAlunoNotas(rows);
+    const fileName = `relatorio-notas-${Date.now()}.pdf`;
+    const filePath = resolveStoragePath(fileName);
+    const doc = new PDFDocument({ margin: 10, size: "A4", layout: "landscape" });
+    const stream = createWriteStream(filePath);
+    doc.pipe(stream);
+    doc.fontSize(14).font("Helvetica-Bold").text("Relatório de Notas por Atividade", { align: "center" }).moveDown(0.5);
+    doc.fontSize(9).font("Helvetica").text(`Total de Participações: ${rows.length} | Total de Alunos: ${alunos.length}`, { align: "center" }).moveDown(0.5);
+    const [startX, tableTop, rowHeight] = [10, 80, 18];
+    const colWidths = [70, 100, 60, 40, 50, 40, 40, 40];
+    const headers = ["Aluno", "Atividade", "Tipo", "Nota", "Conceito", "Status", "Turma", "Pres."];
+    const totalWidth = colWidths.reduce((a, b) => a + b, 0);
+    const drawHeaders = (yPos) => {
+      doc.rect(startX, yPos - 2, totalWidth, rowHeight).fill("#4472C4");
+      let x = startX;
+      headers.forEach((h, i) => {
+        doc.font("Helvetica-Bold").fontSize(7).fillColor("#FFFFFF").text(h, x + 2, yPos + 4, { width: colWidths[i] - 4, align: "center" });
+        x += colWidths[i];
+      });
+      doc.fillColor("#000000");
+    };
+    let yPos = tableTop;
+    drawHeaders(yPos);
+    yPos += rowHeight;
     rows.forEach((r, idx) => {
       if (yPos > 520) {
         doc.addPage({ margin: 10, size: "A4", layout: "landscape" });
@@ -437,59 +618,47 @@ app.get("/download/pdf-detalhado", async (req, res) => {
         drawHeaders(yPos);
         yPos += rowHeight;
       }
-
-      const totalSec = timeToSec(r.horas);
-      const realSec = Math.floor(totalSec * 0.6);
-      const simSec = Math.floor(totalSec * 0.4);
-      const pctReal = totalSec ? +((realSec / totalSec) * 100).toFixed(1) : 0;
-      const pctSim = totalSec ? +((simSec / totalSec) * 100).toFixed(1) : 0;
-
       if (idx % 2 === 0) doc.rect(startX, yPos - 2, totalWidth, rowHeight).fill("#F2F2F2");
-      
       const rowData = [
-        r.aluno.substring(0, 15),
-        r.turma.substring(0, 20),
-        r.atividade.substring(0, 18),
-        r.atividade_tipo ? r.atividade_tipo.substring(0, 8) : 'N/A',
-        r.nota !== null ? r.nota : 'N/A',
+        r.aluno.substring(0, 20),
+        r.atividade.substring(0, 25),
+        r.atividade_tipo ? r.atividade_tipo.substring(0, 10) : 'N/A',
+        r.nota !== null && r.nota !== undefined ? r.nota : 'Pend',
         r.conceito ? r.conceito.substring(0, 8) : 'N/A',
-        r.presenca ? 'Sim' : 'Não',
-        r.horas || '00:00',
-        secToHHMMSS(realSec),
-        secToHHMMSS(simSec),
-        pctReal + '%',
-        pctSim + '%',
-        r.status ? r.status.substring(0, 8) : 'N/A',
-        r.professores ? r.professores.substring(0, 15) : 'N/A',
+        r.status.substring(0, 8),
+        r.turma.substring(0, 15),
+        r.presenca ? 'Sim' : 'Não'
       ];
-
       let x = startX;
       rowData.forEach((val, i) => {
-        doc.font("Helvetica").fontSize(6).fillColor("#000000").text(String(val), x + 2, yPos + 4, { width: colWidths[i] - 4, align: i < 3 ? "left" : "center" });
+        doc.font("Helvetica").fontSize(6).fillColor("#000000").text(String(val), x + 2, yPos + 4, { width: colWidths[i] - 4, align: i < 2 ? "left" : "center" });
         x += colWidths[i];
       });
-
       yPos += rowHeight;
     });
-
+    if (yPos > 450) { doc.addPage({ margin: 10, size: "A4", layout: "landscape" }); yPos = 40; }
+    yPos += 20;
+    doc.fontSize(12).font("Helvetica-Bold").fillColor("#000000").text("Resumo por Aluno", startX, yPos);
+    yPos += 20;
+    alunos.forEach(a => {
+      const alunoRows = rows.filter(r => r.aluno_id === a.aluno_id);
+      const aprovacoes = alunoRows.filter(r => r.status === "Aprovado").length;
+      const reprovacoes = alunoRows.filter(r => r.status === "Reprovado").length;
+      doc.fontSize(9).font("Helvetica").text(`${a.aluno} (${a.turma}): Média ${a.mediaNotas !== null ? a.mediaNotas.toFixed(2) : 'N/A'} | ${aprovacoes} aprovações | ${reprovacoes} reprovações`, startX, yPos);
+      yPos += 15;
+      if (yPos > 550) { doc.addPage({ margin: 10, size: "A4", layout: "landscape" }); yPos = 40; }
+    });
     doc.end();
-    await new Promise((resolve, reject) => {
-      stream.on("finish", resolve);
-      stream.on("error", reject);
-    });
-
+    await new Promise((resolve, reject) => { stream.on("finish", resolve); stream.on("error", reject); });
     const fileStats = await stat(filePath);
-    await salvarRelatorio({
-      tipo: 'pdf', arquivo_nome: fileName, arquivo_path: filePath, tamanho_bytes: fileStats.size,
-      filtros: req.query, estatisticas: { totalParticipacoes: rows.length, totalAlunos: alunosUnicos, totalAtividades: total, mediaNotas: +mediaNotas.toFixed(2), frequencia: +frequencia.toFixed(1) }
-    });
-
+    await salvarRelatorio({ tipo: 'pdf', arquivo_nome: fileName, arquivo_path: filePath, tamanho_bytes: fileStats.size,
+      filtros: req.query, estatisticas: { totalParticipacoes: rows.length, totalAlunos: alunos.length } });
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename=${fileName}`);
     res.send(await readFile(filePath));
   } catch (err) {
-    console.error("Erro /download/pdf-detalhado:", err);
-    if (!res.headersSent) res.status(500).send("Erro ao gerar PDF detalhado: " + err.message);
+    console.error("Erro /download/relatorio-notas-pdf:", err);
+    if (!res.headersSent) res.status(500).send("Erro ao gerar relatório de notas: " + err.message);
   }
 });
 
