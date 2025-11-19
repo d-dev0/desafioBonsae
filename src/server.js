@@ -381,52 +381,84 @@ app.get("/download/relatorio-horas-pdf", async (req, res) => {
     const mediaPorTurma = Array.from(turmaMap.entries()).map(([turma, data]) => ({ turma, mediaHoras: secToHHMMSS(Math.floor(data.totalSec / data.count)), totalAlunos: data.count }));
     const fileName = `relatorio-horas-${Date.now()}.pdf`;
     const filePath = resolveStoragePath(fileName);
-    const doc = new PDFDocument({ margin: 10, size: "A4", layout: "landscape" });
+    const doc = new PDFDocument({ margin: 30, size: "A4", layout: "landscape" });
     const stream = createWriteStream(filePath);
     doc.pipe(stream);
-    doc.fontSize(14).font("Helvetica-Bold").text("Relatório de Horas por Aluno", { align: "center" }).moveDown(0.5);
-    doc.fontSize(9).font("Helvetica").text(`Total de Alunos: ${alunos.length} | Turmas: ${mediaPorTurma.length}`, { align: "center" }).moveDown(0.5);
-    const [startX, tableTop, rowHeight] = [10, 80, 18];
-    const colWidths = [50, 80, 60, 50, 50, 40, 40, 50, 40, 40];
+    
+    doc.fontSize(16).font("Helvetica-Bold").text("Relatório de Horas por Aluno", { align: "center" }).moveDown(0.5);
+    doc.fontSize(10).font("Helvetica").text(`Total de Alunos: ${alunos.length} | Turmas: ${mediaPorTurma.length}`, { align: "center" }).moveDown(1);
+    
+    const pageWidth = 842;
+    const margin = 10;
+    const availableWidth = pageWidth - (margin * 2);
+    const startX = margin;
+    const tableTop = 110;
+    const rowHeight = 20;
+    
+    const colWidths = [120, 140, 80, 70, 70, 60, 60, 80, 70, 72];
     const headers = ["Aluno", "Turma", "Total Horas", "H.Real", "H.Sim", "% R", "% S", "Atividades", "Presenças", "Freq%"];
     const totalWidth = colWidths.reduce((a, b) => a + b, 0);
+    
     const drawHeaders = (yPos) => {
-      doc.rect(startX, yPos - 2, totalWidth, rowHeight).fill("#4472C4");
+      doc.rect(startX, yPos, totalWidth, rowHeight).fillAndStroke("#4472C4", "#000000");
       let x = startX;
       headers.forEach((h, i) => {
-        doc.font("Helvetica-Bold").fontSize(7).fillColor("#FFFFFF").text(h, x + 2, yPos + 4, { width: colWidths[i] - 4, align: "center" });
+        doc.font("Helvetica-Bold").fontSize(8).fillColor("#FFFFFF").text(h, x + 3, yPos + 6, { width: colWidths[i] - 6, align: "center" });
         x += colWidths[i];
       });
-      doc.fillColor("#000000");
     };
+    
     let yPos = tableTop;
     drawHeaders(yPos);
     yPos += rowHeight;
+    
     alunos.forEach((a, idx) => {
       if (yPos > 520) {
-        doc.addPage({ margin: 10, size: "A4", layout: "landscape" });
-        yPos = 40;
+        doc.addPage({ margin: 30, size: "A4", layout: "landscape" });
+        yPos = 50;
         drawHeaders(yPos);
         yPos += rowHeight;
       }
-      if (idx % 2 === 0) doc.rect(startX, yPos - 2, totalWidth, rowHeight).fill("#F2F2F2");
-      const rowData = [a.aluno.substring(0, 15), a.turma.substring(0, 20), a.total, a.total_real, a.total_simulada,
-        a.distribuicao.pctReal + '%', a.distribuicao.pctSimulada + '%', a.participacao.atividades, a.participacao.presencas, a.participacao.frequenciaPct + '%'];
+      
+      if (idx % 2 === 0) {
+        doc.rect(startX, yPos, totalWidth, rowHeight).fill("#F2F2F2");
+      }
+      
+      doc.rect(startX, yPos, totalWidth, rowHeight).stroke("#CCCCCC");
+      
+      const rowData = [
+        a.aluno.substring(0, 25), 
+        a.turma.substring(0, 30), 
+        a.total, 
+        a.total_real, 
+        a.total_simulada,
+        a.distribuicao.pctReal + '%', 
+        a.distribuicao.pctSimulada + '%', 
+        a.participacao.atividades, 
+        a.participacao.presencas, 
+        a.participacao.frequenciaPct + '%'
+      ];
+      
       let x = startX;
       rowData.forEach((val, i) => {
-        doc.font("Helvetica").fontSize(6).fillColor("#000000").text(String(val), x + 2, yPos + 4, { width: colWidths[i] - 4, align: i < 2 ? "left" : "center" });
+        doc.font("Helvetica").fontSize(7).fillColor("#000000").text(String(val), x + 3, yPos + 6, { width: colWidths[i] - 6, align: i < 2 ? "left" : "center" });
+        if (i < colWidths.length - 1) {
+          doc.moveTo(x + colWidths[i], yPos).lineTo(x + colWidths[i], yPos + rowHeight).stroke("#CCCCCC");
+        }
         x += colWidths[i];
       });
       yPos += rowHeight;
     });
-    if (yPos > 450) { doc.addPage({ margin: 10, size: "A4", layout: "landscape" }); yPos = 40; }
-    yPos += 20;
-    doc.fontSize(12).font("Helvetica-Bold").fillColor("#000000").text("Média de Horas por Turma", startX, yPos);
-    yPos += 20;
+    
+    if (yPos > 450) { doc.addPage({ margin: 30, size: "A4", layout: "landscape" }); yPos = 50; }
+    yPos += 25;
+    doc.fontSize(14).font("Helvetica-Bold").fillColor("#000000").text("Média de Horas por Turma", startX, yPos);
+    yPos += 25;
     mediaPorTurma.forEach(t => {
-      doc.fontSize(9).font("Helvetica").text(`${t.turma}: ${t.mediaHoras} (${t.totalAlunos} alunos)`, startX, yPos);
-      yPos += 15;
+      doc.fontSize(10).font("Helvetica").fillColor("#000000").text(`${t.turma}: ${t.mediaHoras} (${t.totalAlunos} alunos)`, startX, yPos);
+      yPos += 18;
     });
+    
     doc.end();
     await new Promise((resolve, reject) => { stream.on("finish", resolve); stream.on("error", reject); });
     const fileStats = await stat(filePath);
@@ -593,61 +625,85 @@ app.get("/download/relatorio-notas-pdf", async (req, res) => {
     const doc = new PDFDocument({ margin: 10, size: "A4", layout: "landscape" });
     const stream = createWriteStream(filePath);
     doc.pipe(stream);
-    doc.fontSize(14).font("Helvetica-Bold").text("Relatório de Notas por Atividade", { align: "center" }).moveDown(0.5);
-    doc.fontSize(9).font("Helvetica").text(`Total de Participações: ${rows.length} | Total de Alunos: ${alunos.length}`, { align: "center" }).moveDown(0.5);
-    const [startX, tableTop, rowHeight] = [10, 80, 18];
-    const colWidths = [70, 100, 60, 40, 50, 40, 40, 40];
+    
+    doc.fontSize(16).font("Helvetica-Bold").text("Relatório de Notas por Atividade", { align: "center" }).moveDown(0.5);
+    doc.fontSize(10).font("Helvetica").text(`Total de Participações: ${rows.length} | Total de Alunos: ${alunos.length}`, { align: "center" }).moveDown(1);
+    
+    const pageWidth = 842;
+    const margin = 30;
+    const availableWidth = pageWidth - (margin * 2);
+    const tableTop = 110;
+    const rowHeight = 20;
+    
+    const colWidths = [130, 180, 100, 80, 90, 80, 82, 80];
     const headers = ["Aluno", "Atividade", "Tipo", "Nota", "Conceito", "Status", "Turma", "Pres."];
     const totalWidth = colWidths.reduce((a, b) => a + b, 0);
+
+    const startX = (pageWidth - totalWidth) / 2;
+    
     const drawHeaders = (yPos) => {
-      doc.rect(startX, yPos - 2, totalWidth, rowHeight).fill("#4472C4");
+      doc.rect(startX, yPos, totalWidth, rowHeight).fillAndStroke("#4472C4", "#000000");
       let x = startX;
       headers.forEach((h, i) => {
-        doc.font("Helvetica-Bold").fontSize(7).fillColor("#FFFFFF").text(h, x + 2, yPos + 4, { width: colWidths[i] - 4, align: "center" });
+        doc.font("Helvetica-Bold").fontSize(8).fillColor("#FFFFFF").text(h, x + 3, yPos + 6, { width: colWidths[i] - 6, align: "center" });
         x += colWidths[i];
       });
-      doc.fillColor("#000000");
     };
+    
     let yPos = tableTop;
     drawHeaders(yPos);
     yPos += rowHeight;
+    
     rows.forEach((r, idx) => {
       if (yPos > 520) {
-        doc.addPage({ margin: 10, size: "A4", layout: "landscape" });
-        yPos = 40;
+        doc.addPage({ margin: 30, size: "A4", layout: "landscape" });
+        yPos = 50;
         drawHeaders(yPos);
         yPos += rowHeight;
       }
-      if (idx % 2 === 0) doc.rect(startX, yPos - 2, totalWidth, rowHeight).fill("#F2F2F2");
+      
+      if (idx % 2 === 0) {
+        doc.rect(startX, yPos, totalWidth, rowHeight).fill("#F2F2F2");
+      }
+      
+      doc.rect(startX, yPos, totalWidth, rowHeight).stroke("#CCCCCC");
+      
       const rowData = [
-        r.aluno.substring(0, 20),
-        r.atividade.substring(0, 25),
-        r.atividade_tipo ? r.atividade_tipo.substring(0, 10) : 'N/A',
+        r.aluno.substring(0, 30),
+        r.atividade.substring(0, 40),
+        r.atividade_tipo ? r.atividade_tipo.substring(0, 15) : 'N/A',
         r.nota !== null && r.nota !== undefined ? r.nota : 'Pend',
-        r.conceito ? r.conceito.substring(0, 8) : 'N/A',
-        r.status.substring(0, 8),
-        r.turma.substring(0, 15),
+        r.conceito ? r.conceito.substring(0, 12) : 'N/A',
+        r.status.substring(0, 12),
+        r.turma.substring(0, 20),
         r.presenca ? 'Sim' : 'Não'
       ];
+      
       let x = startX;
       rowData.forEach((val, i) => {
-        doc.font("Helvetica").fontSize(6).fillColor("#000000").text(String(val), x + 2, yPos + 4, { width: colWidths[i] - 4, align: i < 2 ? "left" : "center" });
+        doc.font("Helvetica").fontSize(7).fillColor("#000000").text(String(val), x + 3, yPos + 6, { width: colWidths[i] - 6, align: i < 2 ? "left" : "center" });
+        if (i < colWidths.length - 1) {
+          doc.moveTo(x + colWidths[i], yPos).lineTo(x + colWidths[i], yPos + rowHeight).stroke("#CCCCCC");
+        }
         x += colWidths[i];
       });
       yPos += rowHeight;
     });
-    if (yPos > 450) { doc.addPage({ margin: 10, size: "A4", layout: "landscape" }); yPos = 40; }
-    yPos += 20;
-    doc.fontSize(12).font("Helvetica-Bold").fillColor("#000000").text("Resumo por Aluno", startX, yPos);
-    yPos += 20;
+    
+    if (yPos > 450) { doc.addPage({ margin: 30, size: "A4", layout: "landscape" }); yPos = 50; }
+    yPos += 25;
+    doc.fontSize(14).font("Helvetica-Bold").fillColor("#000000").text("Resumo por Aluno", startX, yPos);
+    yPos += 25;
+    
     alunos.forEach(a => {
       const alunoRows = rows.filter(r => r.aluno_id === a.aluno_id);
       const aprovacoes = alunoRows.filter(r => r.status === "Aprovado").length;
       const reprovacoes = alunoRows.filter(r => r.status === "Reprovado").length;
-      doc.fontSize(9).font("Helvetica").text(`${a.aluno} (${a.turma}): Média ${a.mediaNotas !== null ? a.mediaNotas.toFixed(2) : 'N/A'} | ${aprovacoes} aprovações | ${reprovacoes} reprovações`, startX, yPos);
-      yPos += 15;
-      if (yPos > 550) { doc.addPage({ margin: 10, size: "A4", layout: "landscape" }); yPos = 40; }
+      doc.fontSize(10).font("Helvetica").fillColor("#000000").text(`${a.aluno} (${a.turma}): Média ${a.mediaNotas !== null ? a.mediaNotas.toFixed(2) : 'N/A'} | ${aprovacoes} aprovações | ${reprovacoes} reprovações`, startX, yPos);
+      yPos += 18;
+      if (yPos > 550) { doc.addPage({ margin: 30, size: "A4", layout: "landscape" }); yPos = 50; }
     });
+    
     doc.end();
     await new Promise((resolve, reject) => { stream.on("finish", resolve); stream.on("error", reject); });
     const fileStats = await stat(filePath);
