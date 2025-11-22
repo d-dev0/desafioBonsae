@@ -8,7 +8,7 @@ import swaggerJsdoc from 'swagger-jsdoc';
 import { pool } from "./db.js";
 import { salvarRelatorio, listarRelatorios, buscarRelatorioSalvo, registrarDownload, removerRelatorio, ensureStorageDir, resolveStoragePath } from "./storage.js";
 import { writeFile, stat, readFile } from "fs/promises";
-import { createWriteStream } from "fs";
+import { createWriteStream, existsSync } from "fs";
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -385,6 +385,13 @@ app.get("/download/relatorio-horas-pdf", async (req, res) => {
     const stream = createWriteStream(filePath);
     doc.pipe(stream);
     
+    // Adicionar logo no topo esquerdo
+    const logoPath = path.join(__dirname, '..', 'assets', 'images', 'academy-2.png');
+    if (existsSync(logoPath)) {
+      const logoWidth = 100;
+      doc.image(logoPath, 30, 20, { width: logoWidth });
+    }
+    
     doc.fontSize(16).font("Helvetica-Bold").text("Relatório de Horas por Aluno", { align: "center" }).moveDown(0.5);
     doc.fontSize(10).font("Helvetica").text(`Total de Alunos: ${alunos.length} | Turmas: ${mediaPorTurma.length}`, { align: "center" }).moveDown(1);
     
@@ -413,53 +420,52 @@ app.get("/download/relatorio-horas-pdf", async (req, res) => {
     yPos += rowHeight;
     
     alunos.forEach((a, idx) => {
-      if (yPos > 520) {
-        doc.addPage({ margin: 30, size: "A4", layout: "landscape" });
-        yPos = 50;
-        drawHeaders(yPos);
-        yPos += rowHeight;
-      }
-      
-      if (idx % 2 === 0) {
-        doc.rect(startX, yPos, totalWidth, rowHeight).fill("#F2F2F2");
-      }
-      
-      doc.rect(startX, yPos, totalWidth, rowHeight).stroke("#CCCCCC");
-      
-      const rowData = [
-        a.aluno.substring(0, 25), 
-        a.turma.substring(0, 30), 
-        a.total, 
-        a.total_real, 
-        a.total_simulada,
-        a.distribuicao.pctReal + '%', 
-        a.distribuicao.pctSimulada + '%', 
-        a.participacao.atividades, 
-        a.participacao.presencas, 
-        a.participacao.frequenciaPct + '%'
-      ];
-      
-      let x = startX;
-      rowData.forEach((val, i) => {
-        doc.font("Helvetica").fontSize(7).fillColor("#000000").text(String(val), x + 3, yPos + 6, { width: colWidths[i] - 6, align: i < 2 ? "left" : "center" });
-        if (i < colWidths.length - 1) {
-          doc.moveTo(x + colWidths[i], yPos).lineTo(x + colWidths[i], yPos + rowHeight).stroke("#CCCCCC");
-        }
-        x += colWidths[i];
-      });
-      yPos += rowHeight;
-    });
-    
-    if (yPos > 450) { doc.addPage({ margin: 30, size: "A4", layout: "landscape" }); yPos = 50; }
-    yPos += 25;
-    doc.fontSize(14).font("Helvetica-Bold").fillColor("#000000").text("Média de Horas por Turma", startX, yPos);
-    yPos += 25;
-    mediaPorTurma.forEach(t => {
-      doc.fontSize(10).font("Helvetica").fillColor("#000000").text(`${t.turma}: ${t.mediaHoras} (${t.totalAlunos} alunos)`, startX, yPos);
-      yPos += 18;
-    });
+  if (idx % 2 === 0) {
+    doc.rect(startX, yPos, totalWidth, rowHeight).fill("#F2F2F2");
+  }
+  
+  doc.rect(startX, yPos, totalWidth, rowHeight).stroke("#CCCCCC");
+  
+  const rowData = [
+    a.aluno.substring(0, 25), 
+    a.turma.substring(0, 30), 
+    a.total, 
+    a.total_real, 
+    a.total_simulada,
+    a.distribuicao.pctReal + '%', 
+    a.distribuicao.pctSimulada + '%', 
+    a.participacao.atividades, 
+    a.participacao.presencas, 
+    a.participacao.frequenciaPct + '%'
+  ];
+  
+  let x = startX;
+  rowData.forEach((val, i) => {
+    doc.font("Helvetica").fontSize(7).fillColor("#000000").text(
+      String(val),
+      x + 3,
+      yPos + 6,
+      { width: colWidths[i] - 6, align: i < 2 ? "left" : "center" }
+    );
+    if (i < colWidths.length - 1) {
+      doc.moveTo(x + colWidths[i], yPos).lineTo(x + colWidths[i], yPos + rowHeight).stroke("#CCCCCC");
+    }
+    x += colWidths[i];
+  });
+  
+  yPos += rowHeight;
+
+  // Quebra de página só se ainda houver próxima linha
+  if (yPos > 520 && idx < alunos.length - 1) {
+    doc.addPage({ margin: 30, size: "A4", layout: "landscape" });
+    yPos = 50;
+    drawHeaders(yPos);
+    yPos += rowHeight;
+  }
+});
     
     doc.end();
+    
     await new Promise((resolve, reject) => { stream.on("finish", resolve); stream.on("error", reject); });
     const fileStats = await stat(filePath);
     await salvarRelatorio({ tipo: 'pdf', arquivo_nome: fileName, arquivo_path: filePath, tamanho_bytes: fileStats.size,
@@ -622,18 +628,28 @@ app.get("/download/relatorio-notas-pdf", async (req, res) => {
     const alunos = aggregateByAlunoNotas(rows);
     const fileName = `relatorio-notas-${Date.now()}.pdf`;
     const filePath = resolveStoragePath(fileName);
-    const doc = new PDFDocument({ margin: 10, size: "A4", layout: "landscape" });
+    const doc = new PDFDocument({ margin: 30, size: "A4", layout: "landscape" });
     const stream = createWriteStream(filePath);
     doc.pipe(stream);
     
-    doc.fontSize(16).font("Helvetica-Bold").text("Relatório de Notas por Atividade", { align: "center" }).moveDown(0.5);
+    const pageWidth = 842;
+    
+    // Adicionar logo
+    const logoPath = path.join(__dirname, '..', 'assets', 'images', 'academy-2.png');
+    if (existsSync(logoPath)) {
+      const logoWidth = 100;
+      doc.image(logoPath, (pageWidth - logoWidth) / 30, 20, { width: logoWidth });
+    }
+    
+    doc.fontSize(16).font("Helvetica-Bold").text("Relatório de Notas por Atividade", 0, 80, { align: "center" }).moveDown(0.5);
     doc.fontSize(10).font("Helvetica").text(`Total de Participações: ${rows.length} | Total de Alunos: ${alunos.length}`, { align: "center" }).moveDown(1);
     
-    const pageWidth = 842;
     const margin = 30;
     const availableWidth = pageWidth - (margin * 2);
-    const tableTop = 110;
+    const tableTop = 130; // ajustado para acomodar o logo
     const rowHeight = 20;
+    
+    // ... resto do código continua igual
     
     const colWidths = [130, 180, 100, 80, 90, 80, 82, 80];
     const headers = ["Aluno", "Atividade", "Tipo", "Nota", "Conceito", "Status", "Turma", "Pres."];
@@ -689,21 +705,6 @@ app.get("/download/relatorio-notas-pdf", async (req, res) => {
       });
       yPos += rowHeight;
     });
-    
-    if (yPos > 450) { doc.addPage({ margin: 30, size: "A4", layout: "landscape" }); yPos = 50; }
-    yPos += 25;
-    doc.fontSize(14).font("Helvetica-Bold").fillColor("#000000").text("Resumo por Aluno", startX, yPos);
-    yPos += 25;
-    
-    alunos.forEach(a => {
-      const alunoRows = rows.filter(r => r.aluno_id === a.aluno_id);
-      const aprovacoes = alunoRows.filter(r => r.status === "Aprovado").length;
-      const reprovacoes = alunoRows.filter(r => r.status === "Reprovado").length;
-      doc.fontSize(10).font("Helvetica").fillColor("#000000").text(`${a.aluno} (${a.turma}): Média ${a.mediaNotas !== null ? a.mediaNotas.toFixed(2) : 'N/A'} | ${aprovacoes} aprovações | ${reprovacoes} reprovações`, startX, yPos);
-      yPos += 18;
-      if (yPos > 550) { doc.addPage({ margin: 30, size: "A4", layout: "landscape" }); yPos = 50; }
-    });
-    
     doc.end();
     await new Promise((resolve, reject) => { stream.on("finish", resolve); stream.on("error", reject); });
     const fileStats = await stat(filePath);
