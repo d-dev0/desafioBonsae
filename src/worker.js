@@ -1,7 +1,5 @@
 import { createWorker } from './queue.js';
 import { generateLargeXlsx } from './reportGenerator.js';
-import { generateAlunosReport } from './dbReportGenerator.js';
-import { generateTurmaReport } from './dbTurmaReportGenerator.js';
 import { gerarRelatorioHorasExcel, gerarRelatorioHorasPdf, gerarRelatorioNotasExcel, gerarRelatorioNotasPdf } from './reportJobs.js';
 
 const processor = async (job) => {
@@ -19,10 +17,6 @@ const processor = async (job) => {
       result = await gerarRelatorioNotasExcel({ filtros, usuario });
     } else if (type === 'relatorio-notas-pdf') {
       result = await gerarRelatorioNotasPdf({ filtros, usuario });
-    } else if (type === 'alunos') {
-      result = await generateAlunosReport();
-    } else if (type === 'turma') {
-      result = await generateTurmaReport(turmaId);
     } else {
       result = await generateLargeXlsx({ rows, columns, title });
     }

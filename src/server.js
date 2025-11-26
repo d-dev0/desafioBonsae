@@ -7,7 +7,7 @@ import swaggerUi from 'swagger-ui-express';
 import swaggerJsdoc from 'swagger-jsdoc';
 import { pool } from "./db.js";
 import { salvarRelatorio, listarRelatorios, buscarRelatorioSalvo, registrarDownload, removerRelatorio, ensureStorageDir, resolveStoragePath } from "./storage.js";
-import { writeFile, stat, readFile } from "fs/promises";
+import { stat, readFile } from "fs/promises";
 import { createWriteStream, existsSync } from "fs";
 import { gerarRelatorioHorasExcel, gerarRelatorioHorasPdf, gerarRelatorioNotasExcel, gerarRelatorioNotasPdf } from "./reportJobs.js";
 import { reportQueue, createWorker } from "./queue.js";
@@ -196,16 +196,6 @@ const aggregateByAlunoNotas = (rows) => {
       frequenciaPct: a.atividades ? +((a.presencas / a.atividades) * 100).toFixed(1) : 0,
     };
   }).sort((a, b) => a.aluno_id - b.aluno_id);
-};
-
-// Função auxiliar para cálculo de estatísticas
-const calcEstatisticas = (rows, alunos) => {
-  const notasValidas = rows.map(r => parseFloat(r.nota)).filter(n => !isNaN(n));
-  return {
-    total: rows.length, alunosUnicos: alunos.length,
-    mediaNotas: notasValidas.length ? notasValidas.reduce((s, n) => s + n, 0) / notasValidas.length : 0,
-    frequencia: rows.length ? (rows.filter(r => r.presenca).length / rows.length) * 100 : 0
-  };
 };
 
 // --- Download Relatório de Horas por Aluno (Excel) ---
