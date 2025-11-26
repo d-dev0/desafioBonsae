@@ -9,6 +9,9 @@ import { pool } from "./db.js";
 import { salvarRelatorio, listarRelatorios, buscarRelatorioSalvo, registrarDownload, removerRelatorio, ensureStorageDir, resolveStoragePath } from "./storage.js";
 import { writeFile, stat, readFile } from "fs/promises";
 import { createWriteStream, existsSync } from "fs";
+import { gerarRelatorioHorasExcel, gerarRelatorioHorasPdf, gerarRelatorioNotasExcel, gerarRelatorioNotasPdf } from "./reportJobs.js";
+import { reportQueue, createWorker } from "./queue.js";
+import { config } from "./config.js";
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -28,6 +31,25 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
+});
+
+// --- Worker BullMQ para processamento assíncrono de relatórios ---
+// Não altera o comportamento atual das rotas /download/...; apenas processa jobs enfileirados nas novas rotas /async/...
+createWorker(async (job) => {
+  const { type, filtros, usuario } = job.data || {};
+
+  switch (type) {
+    case "relatorio-horas-excel":
+      return await gerarRelatorioHorasExcel({ filtros, usuario });
+    case "relatorio-horas-pdf":
+      return await gerarRelatorioHorasPdf({ filtros, usuario });
+    case "relatorio-notas-excel":
+      return await gerarRelatorioNotasExcel({ filtros, usuario });
+    case "relatorio-notas-pdf":
+      return await gerarRelatorioNotasPdf({ filtros, usuario });
+    default:
+      throw new Error(`Tipo de job desconhecido: ${type}`);
+  }
 });
 
 // --- Swagger/OpenAPI ---
@@ -113,51 +135,6 @@ const aggregateByAluno = (rows) => {
       totalNotas: a.notas.length,
     };
   }).sort((a, b) => a.aluno_id - b.aluno_id);
-};
-
-// --- Health / root ---
-/**
- * @openapi
- * /:
- *   get:
- *     summary: Health check
- *     responses:
- *       200:
- *         description: API running
- */
-app.get("/", (req, res) => {
-  res.json({ status: "ok", message: "API de relatórios rodando" });
-});
-
-const buscarRelatorio = async (filtros = {}) => {
-  const { turma_id, professor_id, atividade_id, aluno_id, presenca, conceito, status } = filtros;
-  const params = [], where = [];
-  
-  let query = `SELECT a.id AS aluno_id, a.nome AS aluno, a.email, 
-    t.id AS turma_id, t.nome AS turma, 
-    atv.id AS atividade_id, atv.nome AS atividade, atv.tipo AS atividade_tipo,
-    p.nota, p.conceito, p.presenca, p.horas, p.status_avaliacao,
-    string_agg(DISTINCT prof.nome, ', ') AS professores
-    FROM participacoes p JOIN alunos a ON a.id = p.aluno_id JOIN turmas t ON t.id = p.turma_id
-    JOIN atividades atv ON atv.id = p.atividade_id LEFT JOIN professor_turma pt ON pt.turma_id = t.id
-    LEFT JOIN professores prof ON prof.id = pt.professor_id`;
-
-  if (turma_id) { params.push(turma_id); where.push(`t.id = $${params.length}`); }
-  if (aluno_id) { params.push(aluno_id); where.push(`a.id = $${params.length}`); }
-  if (professor_id) { params.push(professor_id); where.push(`prof.id = $${params.length}`); }
-  if (atividade_id) { params.push(atividade_id); where.push(`atv.id = $${params.length}`); }
-  if (presenca !== undefined && presenca !== "") {
-    params.push(presenca === "Presente" || presenca === "true" || presenca === true);
-    where.push(`p.presenca = $${params.length}`);
-  }
-  if (conceito) { params.push(conceito); where.push(`p.conceito = $${params.length}`); }
-  
-  if (where.length) query += " WHERE " + where.join(" AND ");
-  query += ` GROUP BY a.id, t.id, atv.id, p.id ORDER BY a.id, atv.id`;
-  
-  const result = await pool.query(query, params);
-  result.rows.forEach(r => r.status = r.nota === null ? "Pendente" : Number(r.nota) >= 6 ? "Aprovado" : "Reprovado");
-  return status ? result.rows.filter(r => r.status === status) : result.rows;
 };
 
 // Função específica para relatório de notas (sem horas)
@@ -420,49 +397,48 @@ app.get("/download/relatorio-horas-pdf", async (req, res) => {
     yPos += rowHeight;
     
     alunos.forEach((a, idx) => {
-  if (idx % 2 === 0) {
-    doc.rect(startX, yPos, totalWidth, rowHeight).fill("#F2F2F2");
-  }
-  
-  doc.rect(startX, yPos, totalWidth, rowHeight).stroke("#CCCCCC");
-  
-  const rowData = [
-    a.aluno.substring(0, 25), 
-    a.turma.substring(0, 30), 
-    a.total, 
-    a.total_real, 
-    a.total_simulada,
-    a.distribuicao.pctReal + '%', 
-    a.distribuicao.pctSimulada + '%', 
-    a.participacao.atividades, 
-    a.participacao.presencas, 
-    a.participacao.frequenciaPct + '%'
-  ];
-  
-  let x = startX;
-  rowData.forEach((val, i) => {
-    doc.font("Helvetica").fontSize(7).fillColor("#000000").text(
-      String(val),
-      x + 3,
-      yPos + 6,
-      { width: colWidths[i] - 6, align: i < 2 ? "left" : "center" }
-    );
-    if (i < colWidths.length - 1) {
-      doc.moveTo(x + colWidths[i], yPos).lineTo(x + colWidths[i], yPos + rowHeight).stroke("#CCCCCC");
-    }
-    x += colWidths[i];
-  });
-  
-  yPos += rowHeight;
+      if (idx % 2 === 0) {
+        doc.rect(startX, yPos, totalWidth, rowHeight).fill("#F2F2F2");
+      }
+      
+      doc.rect(startX, yPos, totalWidth, rowHeight).stroke("#CCCCCC");
+      
+      const rowData = [
+        a.aluno.substring(0, 25), 
+        a.turma.substring(0, 30), 
+        a.total, 
+        a.total_real, 
+        a.total_simulada,
+        a.distribuicao.pctReal + '%', 
+        a.distribuicao.pctSimulada + '%', 
+        a.participacao.atividades, 
+        a.participacao.presencas, 
+        a.participacao.frequenciaPct + '%'
+      ];
+      
+      let x = startX;
+      rowData.forEach((val, i) => {
+        doc.font("Helvetica").fontSize(7).fillColor("#000000").text(
+          String(val),
+          x + 3,
+          yPos + 6,
+          { width: colWidths[i] - 6, align: i < 2 ? "left" : "center" }
+        );
+        if (i < colWidths.length - 1) {
+          doc.moveTo(x + colWidths[i], yPos).lineTo(x + colWidths[i], yPos + rowHeight).stroke("#CCCCCC");
+        }
+        x += colWidths[i];
+      });
+      yPos += rowHeight;
 
-  // Quebra de página só se ainda houver próxima linha
-  if (yPos > 520 && idx < alunos.length - 1) {
-    doc.addPage({ margin: 30, size: "A4", layout: "landscape" });
-    yPos = 50;
-    drawHeaders(yPos);
-    yPos += rowHeight;
-  }
-});
+      // Quebra de página só se ainda houver próxima linha
+      if (yPos > 520 && idx < alunos.length - 1) {
+        doc.addPage({ margin: 30, size: "A4", layout: "landscape" });
+        yPos = 50;
+        drawHeaders(yPos);
+        yPos += rowHeight;
+      }
+    });
     
     doc.end();
     
@@ -716,6 +692,273 @@ app.get("/download/relatorio-notas-pdf", async (req, res) => {
   } catch (err) {
     console.error("Erro /download/relatorio-notas-pdf:", err);
     if (!res.headersSent) res.status(500).send("Erro ao gerar relatório de notas: " + err.message);
+  }
+});
+
+// --- Rotas assíncronas (enfileiram geração de relatórios) ---
+/**
+ * @openapi
+ * /async/relatorios/horas-excel:
+ *   get:
+ *     tags:
+ *       - Relatórios Assíncronos
+ *     summary: Enfileira geração de relatório de horas por aluno em Excel
+ *     description: Enfileira um job na fila BullMQ para gerar o relatório de horas por aluno em Excel em background.
+ *     parameters:
+ *       - in: query
+ *         name: professor_id
+ *         schema:
+ *           type: integer
+ *         description: ID do professor para filtrar
+ *       - in: query
+ *         name: turma_id
+ *         schema:
+ *           type: integer
+ *         description: ID da turma para filtrar
+ *     responses:
+ *       202:
+ *         description: Relatório enfileirado para geração
+ *       500:
+ *         description: Erro ao enfileirar relatório
+ */
+app.get("/async/relatorios/horas-excel", async (req, res) => {
+  try {
+    const job = await reportQueue.add(
+      "relatorio-horas-excel",
+      {
+        type: "relatorio-horas-excel",
+        filtros: req.query,
+      },
+      {
+        timeout: config.job.timeout,
+        attempts: config.job.attempts,
+        backoff: { type: "fixed", delay: config.job.backoff },
+        removeOnComplete: false,
+        removeOnFail: false,
+      }
+    );
+
+    return res.status(202).json({
+      message: "Geração de relatório de horas (Excel) enfileirada",
+      jobId: job.id,
+    });
+  } catch (err) {
+    console.error("Erro ao enfileirar /async/relatorios/horas-excel:", err);
+    if (!res.headersSent) res.status(500).json({ error: "Erro ao enfileirar relatório de horas (Excel)", details: err.message });
+  }
+});
+
+/**
+ * @openapi
+ * /async/relatorios/horas-pdf:
+ *   get:
+ *     tags:
+ *       - Relatórios Assíncronos
+ *     summary: Enfileira geração de relatório de horas por aluno em PDF
+ *     description: Enfileira um job na fila BullMQ para gerar o relatório de horas por aluno em PDF em background.
+ *     parameters:
+ *       - in: query
+ *         name: professor_id
+ *         schema:
+ *           type: integer
+ *         description: ID do professor para filtrar
+ *       - in: query
+ *         name: turma_id
+ *         schema:
+ *           type: integer
+ *         description: ID da turma para filtrar
+ *     responses:
+ *       202:
+ *         description: Relatório enfileirado para geração
+ *       500:
+ *         description: Erro ao enfileirar relatório
+ */
+app.get("/async/relatorios/horas-pdf", async (req, res) => {
+  try {
+    const job = await reportQueue.add(
+      "relatorio-horas-pdf",
+      {
+        type: "relatorio-horas-pdf",
+        filtros: req.query,
+      },
+      {
+        timeout: config.job.timeout,
+        attempts: config.job.attempts,
+        backoff: { type: "fixed", delay: config.job.backoff },
+        removeOnComplete: false,
+        removeOnFail: false,
+      }
+    );
+
+    return res.status(202).json({
+      message: "Geração de relatório de horas (PDF) enfileirada",
+      jobId: job.id,
+    });
+  } catch (err) {
+    console.error("Erro ao enfileirar /async/relatorios/horas-pdf:", err);
+    if (!res.headersSent) res.status(500).json({ error: "Erro ao enfileirar relatório de horas (PDF)", details: err.message });
+  }
+});
+
+/**
+ * @openapi
+ * /async/relatorios/notas-excel:
+ *   get:
+ *     tags:
+ *       - Relatórios Assíncronos
+ *     summary: Enfileira geração de relatório de notas em Excel
+ *     description: Enfileira um job na fila BullMQ para gerar o relatório de notas por atividade em Excel em background.
+ *     parameters:
+ *       - in: query
+ *         name: professor_id
+ *         schema:
+ *           type: integer
+ *         description: ID do professor para filtrar
+ *       - in: query
+ *         name: turma_id
+ *         schema:
+ *           type: integer
+ *         description: ID da turma para filtrar
+ *     responses:
+ *       202:
+ *         description: Relatório enfileirado para geração
+ *       500:
+ *         description: Erro ao enfileirar relatório
+ */
+app.get("/async/relatorios/notas-excel", async (req, res) => {
+  try {
+    const job = await reportQueue.add(
+      "relatorio-notas-excel",
+      {
+        type: "relatorio-notas-excel",
+        filtros: req.query,
+      },
+      {
+        timeout: config.job.timeout,
+        attempts: config.job.attempts,
+        backoff: { type: "fixed", delay: config.job.backoff },
+        removeOnComplete: false,
+        removeOnFail: false,
+      }
+    );
+
+    return res.status(202).json({
+      message: "Geração de relatório de notas (Excel) enfileirada",
+      jobId: job.id,
+    });
+  } catch (err) {
+    console.error("Erro ao enfileirar /async/relatorios/notas-excel:", err);
+    if (!res.headersSent) res.status(500).json({ error: "Erro ao enfileirar relatório de notas (Excel)", details: err.message });
+  }
+});
+
+/**
+ * @openapi
+ * /async/relatorios/notas-pdf:
+ *   get:
+ *     tags:
+ *       - Relatórios Assíncronos
+ *     summary: Enfileira geração de relatório de notas em PDF
+ *     description: Enfileira um job na fila BullMQ para gerar o relatório de notas por atividade em PDF em background.
+ *     parameters:
+ *       - in: query
+ *         name: professor_id
+ *         schema:
+ *           type: integer
+ *         description: ID do professor para filtrar
+ *       - in: query
+ *         name: turma_id
+ *         schema:
+ *           type: integer
+ *         description: ID da turma para filtrar
+ *     responses:
+ *       202:
+ *         description: Relatório enfileirado para geração
+ *       500:
+ *         description: Erro ao enfileirar relatório
+ */
+app.get("/async/relatorios/notas-pdf", async (req, res) => {
+  try {
+    const job = await reportQueue.add(
+      "relatorio-notas-pdf",
+      {
+        type: "relatorio-notas-pdf",
+        filtros: req.query,
+      },
+      {
+        timeout: config.job.timeout,
+        attempts: config.job.attempts,
+        backoff: { type: "fixed", delay: config.job.backoff },
+        removeOnComplete: false,
+        removeOnFail: false,
+      }
+    );
+
+    return res.status(202).json({
+      message: "Geração de relatório de notas (PDF) enfileirada",
+      jobId: job.id,
+    });
+  } catch (err) {
+    console.error("Erro ao enfileirar /async/relatorios/notas-pdf:", err);
+    if (!res.headersSent) res.status(500).json({ error: "Erro ao enfileirar relatório de notas (PDF)", details: err.message });
+  }
+});
+
+// --- Status de Job de Relatório Assíncrono ---
+/**
+ * @openapi
+ * /jobs/{id}/status:
+ *   get:
+ *     tags:
+ *       - Relatórios Assíncronos
+ *     summary: Consulta o status de um job de geração de relatório
+ *     description: Retorna o estado atual do job na fila (waiting, active, completed, failed, etc.) e, se concluído, o id do relatório gerado.
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: ID do job retornado ao enfileirar a geração do relatório
+ *     responses:
+ *       200:
+ *         description: Status do job retornado com sucesso
+ *       404:
+ *         description: Job não encontrado
+ *       500:
+ *         description: Erro ao consultar status do job
+ */
+app.get("/jobs/:id/status", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const job = await reportQueue.getJob(id);
+
+    if (!job) {
+      return res.status(404).json({ error: "Job não encontrado" });
+    }
+
+    const state = await job.getState();
+    let relatorioId = null;
+
+    if (state === "completed" && job.returnvalue && typeof job.returnvalue === "object") {
+      relatorioId = job.returnvalue.relatorioId || job.returnvalue.relatorio_id || null;
+    }
+
+    return res.json({
+      id: String(job.id),
+      state,
+      progress: job.progress || 0,
+      relatorioId,
+      failedReason: state === "failed" ? job.failedReason || null : null,
+      attemptsMade: job.attemptsMade,
+      createdAt: job.timestamp,
+      processedOn: job.processedOn || null,
+      finishedOn: job.finishedOn || null,
+      name: job.name,
+    });
+  } catch (err) {
+    console.error("Erro ao consultar status de job:", err);
+    if (!res.headersSent) res.status(500).json({ error: "Erro ao consultar status de job", message: err.message });
   }
 });
 
